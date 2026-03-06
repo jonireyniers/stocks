@@ -1518,9 +1518,49 @@ with st.sidebar:
             save_user_portfolio(st.session_state.current_user, {
                 "portfolio_raw": portfolio_raw,
                 "watchlist_raw": watchlist_raw,
+                "price_alerts": user_data.get("price_alerts", []),
+                "portfolio_history": user_data.get("portfolio_history", []),
+                "watchlist_categories": user_data.get("watchlist_categories", {}),
             })
             st.success(f"✅ {remove_ticker} verwijderd!")
             st.rerun()
+
+    # --- Bulk Import ---
+    st.divider()
+    st.subheader("📥 Bulk Import")
+    st.caption("Plak meerdere stocks (één per regel: TICKER, AANTAL, PRIJS, MUNT)")
+    
+    bulk_input = st.text_area(
+        "Bulk import",
+        height=150,
+        placeholder="AMD, 62.0, 151.06\nMETA, 7.0, 768.47\nGOOG, 14.0, 186.35, USD",
+        label_visibility="collapsed",
+    )
+    
+    if st.button("📥 Importeer Alle", use_container_width=True):
+        if bulk_input.strip():
+            # Parse existing portfolio
+            existing_lines = [l.strip() for l in portfolio_raw.strip().split('\n') if l.strip()]
+            
+            # Add new lines from bulk input
+            new_lines = [l.strip() for l in bulk_input.strip().split('\n') if l.strip()]
+            
+            # Combine
+            all_lines = existing_lines + new_lines
+            portfolio_raw = '\n'.join(all_lines)
+            
+            # Save
+            save_user_portfolio(st.session_state.current_user, {
+                "portfolio_raw": portfolio_raw,
+                "watchlist_raw": watchlist_raw,
+                "price_alerts": user_data.get("price_alerts", []),
+                "portfolio_history": user_data.get("portfolio_history", []),
+                "watchlist_categories": user_data.get("watchlist_categories", {}),
+            })
+            st.success(f"✅ {len(new_lines)} stocks geïmporteerd!")
+            st.rerun()
+        else:
+            st.error("⚠️ Plak eerst stocks om te importeren")
 
     # --- Watchlist input ---
     st.divider()
