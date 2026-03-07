@@ -12,6 +12,9 @@ from pathlib import Path
 import io
 import base64
 import csv
+import re
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -38,8 +41,14 @@ def load_user_portfolio(username: str) -> dict:
                 data["portfolio_history"] = []
             if "watchlist_categories" not in data:
                 data["watchlist_categories"] = {}
+            if "youtubers" not in data:
+                data["youtubers"] = []
+            if "youtuber_picks" not in data:
+                data["youtuber_picks"] = []
+            if "analyzed_videos" not in data:
+                data["analyzed_videos"] = []
             return data
-    return {"portfolio_raw": "", "watchlist_raw": "", "price_alerts": [], "portfolio_history": [], "watchlist_categories": {}}
+    return {"portfolio_raw": "", "watchlist_raw": "", "price_alerts": [], "portfolio_history": [], "watchlist_categories": {}, "youtubers": [], "youtuber_picks": [], "analyzed_videos": []}
 
 def save_user_portfolio(username: str, data: dict):
     """Save user's portfolio to JSON file."""
@@ -51,60 +60,591 @@ def get_all_users() -> list:
     """Get list of all registered users."""
     return [f.stem for f in DATA_DIR.glob("*.json")]
 
-# ── Custom CSS (dark-mode polish) ─────────────────────────────────────────────
-st.markdown(
-    """
-    <style>
-      /* Main background */
-      .stApp { background-color: #0e1117; }
+# ── Custom CSS ────────────────────────────────────────────────────────────────
 
-      /* Metric cards */
+# Mobile viewport meta tag for proper scaling
+st.markdown("""
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<style>
+    /* Global responsive base styles */
+    * { box-sizing: border-box; }
+    html, body { 
+        -webkit-text-size-adjust: 100%; 
+        touch-action: manipulation;
+    }
+    
+    /* Prevent horizontal scroll */
+    .main .block-container { 
+        max-width: 100% !important; 
+        overflow-x: hidden;
+    }
+    
+    /* Make all images responsive */
+    img { max-width: 100%; height: auto; }
+    
+    /* Touch-friendly tap targets */
+    button, a, input, select { min-height: 44px; }
+    
+    /* Scrollable tables on mobile */
+    .stDataFrame { 
+        overflow-x: auto; 
+        -webkit-overflow-scrolling: touch;
+    }
+    
+    /* Better touch scrolling for tabs */
+    [data-baseweb="tab-list"] {
+        -webkit-overflow-scrolling: touch;
+        scrollbar-width: none;
+        -ms-overflow-style: none;
+    }
+    [data-baseweb="tab-list"]::-webkit-scrollbar { display: none; }
+</style>
+""", unsafe_allow_html=True)
+
+# Initialize theme in session state
+if "theme" not in st.session_state:
+    st.session_state.theme = "dark"  # Default to dark mode
+
+# Theme-specific CSS
+if st.session_state.theme == "dark":
+    theme_css = """
+    <style>
+      /* ════════════════════════════════════════════════════════════════════════
+         DARK MODE - Diepe zwarte/blauwe tinten met heldere accenten
+         ════════════════════════════════════════════════════════════════════════ */
+      
+      /* Main backgrounds - deep dark */
+      .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"], 
+      .main, .main .block-container { 
+          background-color: #0a0e14 !important; 
+      }
+
+      /* Metric cards - dark panels with blue glow */
       div[data-testid="metric-container"] {
-          background-color: #1c1f26;
-          border: 1px solid #2e3140;
-          border-radius: 12px;
-          padding: 18px 24px;
+          background: linear-gradient(145deg, #141a24, #0f1319) !important;
+          border: 1px solid #1e3a5f !important;
+          border-radius: 14px;
+          padding: 20px 26px;
+          box-shadow: 0 4px 20px rgba(30, 58, 95, 0.3);
       }
       div[data-testid="metric-container"] label {
-          color: #8b949e !important;
-          font-size: 0.80rem;
+          color: #7eb8da !important;
+          font-size: 0.78rem;
           text-transform: uppercase;
-          letter-spacing: 0.08em;
+          letter-spacing: 0.1em;
       }
       div[data-testid="metric-container"] div[data-testid="stMetricValue"] {
-          font-size: 1.6rem;
+          font-size: 1.7rem;
           font-weight: 700;
-          color: #e6edf3 !important;
+          color: #ffffff !important;
       }
 
-      /* Tab styling */
+      /* Tab styling - glowing tabs */
+      [data-baseweb="tab-list"] {
+          background-color: #0f1419 !important;
+          border-radius: 10px;
+          padding: 4px;
+      }
       button[data-baseweb="tab"] {
-          font-size: 0.95rem;
+          font-size: 0.92rem;
           font-weight: 600;
-          color: #8b949e;
+          color: #7a8599 !important;
+          background-color: transparent !important;
       }
       button[data-baseweb="tab"][aria-selected="true"] {
-          color: #58a6ff;
-          border-bottom: 2px solid #58a6ff;
+          color: #58a6ff !important;
+          background-color: #1a2332 !important;
+          border-radius: 8px;
+          border-bottom: 3px solid #58a6ff !important;
       }
 
       /* DataFrame */
-      .stDataFrame { border-radius: 10px; overflow: hidden; }
+      .stDataFrame { 
+          border-radius: 12px; 
+          overflow: hidden;
+          border: 1px solid #1e3a5f;
+      }
 
-      /* Sidebar */
-      section[data-testid="stSidebar"] { background-color: #161b22; }
+      /* Sidebar - darker panel */
+      section[data-testid="stSidebar"] { 
+          background: linear-gradient(180deg, #0d1117, #0a0e14) !important;
+          border-right: 1px solid #1e3a5f;
+      }
+      section[data-testid="stSidebar"] h1,
+      section[data-testid="stSidebar"] h2,
+      section[data-testid="stSidebar"] h3,
+      section[data-testid="stSidebar"] p,
+      section[data-testid="stSidebar"] span,
+      section[data-testid="stSidebar"] label {
+          color: #c9d1d9 !important;
+      }
 
-      /* Section headers */
-      h2, h3 { color: #e6edf3; }
+      /* Section headers - bright white */
+      h1, h2, h3, h4 { color: #ffffff !important; }
+      
+      /* Text colors - light gray */
+      p, span, label, .stMarkdown { color: #b0b8c4 !important; }
 
-      /* Status badge helpers – rendered via st.markdown */
-      .badge-buy  { background:#1a4731; color:#3fb950; padding:3px 10px; border-radius:20px; font-weight:700; font-size:.82rem; }
-      .badge-sell { background:#4b1b1b; color:#f85149; padding:3px 10px; border-radius:20px; font-weight:700; font-size:.82rem; }
-      .badge-hold { background:#2d2a1b; color:#e3b341; padding:3px 10px; border-radius:20px; font-weight:700; font-size:.82rem; }
+      /* Status badges - vivid colors */
+      .badge-buy  { background:#0d3320; color:#2dd272; padding:4px 12px; border-radius:20px; font-weight:700; font-size:.82rem; border: 1px solid #2dd272; }
+      .badge-sell { background:#3d1515; color:#ff6b6b; padding:4px 12px; border-radius:20px; font-weight:700; font-size:.82rem; border: 1px solid #ff6b6b; }
+      .badge-hold { background:#3d3010; color:#ffd43b; padding:4px 12px; border-radius:20px; font-weight:700; font-size:.82rem; border: 1px solid #ffd43b; }
+      
+      /* Info boxes */
+      [data-testid="stAlert"] {
+          background-color: #141a24 !important;
+          border: 1px solid #1e3a5f !important;
+          border-radius: 10px;
+      }
+      
+      /* Expander */
+      .streamlit-expanderHeader, details summary { 
+          background-color: #141a24 !important;
+          color: #c9d1d9 !important;
+      }
+      
+      /* Inputs - dark with blue border */
+      .stTextInput input, 
+      .stNumberInput input,
+      .stTextArea textarea,
+      .stSelectbox [data-baseweb="select"] > div {
+          background-color: #0f1419 !important;
+          color: #e6edf3 !important;
+          border: 1px solid #1e3a5f !important;
+          border-radius: 8px;
+      }
+      .stTextInput input:focus, .stNumberInput input:focus {
+          border-color: #58a6ff !important;
+          box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.2) !important;
+      }
+      
+      /* Buttons */
+      .stButton button {
+          background: linear-gradient(145deg, #1a2332, #141a24) !important;
+          color: #c9d1d9 !important;
+          border: 1px solid #1e3a5f !important;
+          border-radius: 8px;
+          font-weight: 600;
+      }
+      .stButton button:hover {
+          background: linear-gradient(145deg, #1e2a3a, #1a2332) !important;
+          border-color: #58a6ff !important;
+          color: #ffffff !important;
+      }
+      .stButton button[kind="primary"] {
+          background: linear-gradient(145deg, #1a5fb4, #1256a0) !important;
+          color: #ffffff !important;
+          border: none !important;
+      }
+      
+      /* Dividers */
+      hr { border-color: #1e3a5f !important; }
+      
+      /* Radio & Checkbox */
+      .stRadio label, .stCheckbox label { color: #c9d1d9 !important; }
+      
+      /* Caption */
+      .stCaption, [data-testid="stCaptionContainer"] { color: #7a8599 !important; }
+      
+      /* ════════════════════════════════════════════════════════════════════════
+         RESPONSIVE - Tablet & Mobile optimizations (Dark Mode)
+         ════════════════════════════════════════════════════════════════════════ */
+      
+      /* Tablet breakpoint */
+      @media (max-width: 1024px) {
+          .main .block-container { padding: 1rem 1.5rem !important; }
+          div[data-testid="metric-container"] { padding: 15px 18px; }
+          div[data-testid="metric-container"] div[data-testid="stMetricValue"] { font-size: 1.4rem; }
+          h1 { font-size: 1.6rem !important; }
+          h2 { font-size: 1.3rem !important; }
+          button[data-baseweb="tab"] { font-size: 0.8rem; padding: 8px 10px; }
+      }
+      
+      /* Mobile breakpoint */
+      @media (max-width: 768px) {
+          /* Reduce padding */
+          .main .block-container { padding: 0.5rem 0.8rem !important; }
+          
+          /* Stack columns vertically */
+          [data-testid="column"] { width: 100% !important; flex: 1 1 100% !important; }
+          
+          /* Metric cards - full width, smaller text */
+          div[data-testid="metric-container"] { 
+              padding: 12px 14px; 
+              margin-bottom: 8px;
+          }
+          div[data-testid="metric-container"] label { font-size: 0.7rem; }
+          div[data-testid="metric-container"] div[data-testid="stMetricValue"] { font-size: 1.2rem; }
+          
+          /* Headers smaller */
+          h1 { font-size: 1.4rem !important; }
+          h2 { font-size: 1.2rem !important; }
+          h3 { font-size: 1rem !important; }
+          
+          /* Tabs - scrollable, smaller */
+          [data-baseweb="tab-list"] { 
+              overflow-x: auto; 
+              -webkit-overflow-scrolling: touch;
+              padding: 4px;
+          }
+          button[data-baseweb="tab"] { 
+              font-size: 0.7rem; 
+              padding: 6px 8px; 
+              white-space: nowrap;
+              min-width: auto;
+          }
+          
+          /* Sidebar - minimize */
+          section[data-testid="stSidebar"] { 
+              width: 260px !important; 
+          }
+          
+          /* Buttons - full width on mobile */
+          .stButton button { 
+              width: 100% !important; 
+              padding: 12px !important;
+              font-size: 0.9rem;
+          }
+          
+          /* DataFrames - scroll horizontally */
+          .stDataFrame { overflow-x: auto !important; }
+          
+          /* Charts - reduce height */
+          [data-testid="stPlotlyChart"] { min-height: 250px !important; }
+          
+          /* Info boxes */
+          [data-testid="stAlert"] { 
+              padding: 10px !important; 
+              font-size: 0.85rem;
+          }
+          
+          /* Input fields - larger touch targets */
+          .stTextInput input, 
+          .stNumberInput input,
+          .stSelectbox [data-baseweb="select"] > div {
+              min-height: 44px !important;
+              font-size: 16px !important; /* Prevents zoom on iOS */
+          }
+      }
+      
+      /* Small mobile */
+      @media (max-width: 480px) {
+          .main .block-container { padding: 0.3rem 0.5rem !important; }
+          h1 { font-size: 1.2rem !important; }
+          h2 { font-size: 1.05rem !important; }
+          div[data-testid="metric-container"] div[data-testid="stMetricValue"] { font-size: 1rem; }
+          button[data-baseweb="tab"] { font-size: 0.65rem; padding: 5px 6px; }
+      }
     </style>
-    """,
-    unsafe_allow_html=True,
-)
+    """
+else:
+    theme_css = """
+    <style>
+      /* ════════════════════════════════════════════════════════════════════════
+         LIGHT MODE - Maximum contrast, bright & clean
+         ════════════════════════════════════════════════════════════════════════ */
+      
+      /* Main backgrounds - pure bright white */
+      .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"], 
+      .main, .main .block-container,
+      [data-testid="stVerticalBlock"],
+      [data-testid="stHorizontalBlock"] { 
+          background-color: #ffffff !important; 
+      }
+
+      /* Metric cards - bright white with strong shadow */
+      div[data-testid="metric-container"] {
+          background: #ffffff !important;
+          border: 3px solid #0066cc !important;
+          border-radius: 16px;
+          padding: 22px 28px;
+          box-shadow: 0 6px 20px rgba(0, 100, 180, 0.15);
+      }
+      div[data-testid="metric-container"] label {
+          color: #003d7a !important;
+          font-size: 0.82rem;
+          text-transform: uppercase;
+          letter-spacing: 0.12em;
+          font-weight: 700;
+      }
+      div[data-testid="metric-container"] div[data-testid="stMetricValue"] {
+          font-size: 1.8rem;
+          font-weight: 800;
+          color: #000000 !important;
+      }
+      div[data-testid="metric-container"] [data-testid="stMetricDelta"] {
+          color: #000000 !important;
+          font-weight: 700;
+      }
+      div[data-testid="metric-container"] [data-testid="stMetricDelta"] svg {
+          fill: #000000 !important;
+      }
+
+      /* Tab styling - high contrast tabs */
+      [data-baseweb="tab-list"] {
+          background-color: #e0ecf8 !important;
+          border-radius: 12px;
+          padding: 6px;
+          border: 2px solid #0066cc;
+      }
+      button[data-baseweb="tab"] {
+          font-size: 0.95rem;
+          font-weight: 700;
+          color: #003366 !important;
+          background-color: transparent !important;
+          padding: 10px 16px;
+      }
+      button[data-baseweb="tab"][aria-selected="true"] {
+          color: #ffffff !important;
+          background-color: #0066cc !important;
+          border-radius: 8px;
+          border-bottom: none !important;
+          box-shadow: 0 4px 12px rgba(0, 102, 204, 0.4);
+      }
+
+      /* DataFrame */
+      .stDataFrame { 
+          border-radius: 14px; 
+          overflow: hidden;
+          border: 3px solid #0066cc;
+          background-color: #ffffff !important;
+      }
+      .stDataFrame th {
+          background-color: #0066cc !important;
+          color: #ffffff !important;
+      }
+
+      /* Sidebar - bright blue accent */
+      section[data-testid="stSidebar"] { 
+          background: linear-gradient(180deg, #d0e4f7, #b8d4f0) !important;
+          border-right: 4px solid #0066cc;
+      }
+      section[data-testid="stSidebar"] h1,
+      section[data-testid="stSidebar"] h2,
+      section[data-testid="stSidebar"] h3 {
+          color: #003366 !important;
+          font-weight: 800;
+      }
+      section[data-testid="stSidebar"] p,
+      section[data-testid="stSidebar"] span,
+      section[data-testid="stSidebar"] label,
+      section[data-testid="stSidebar"] .stMarkdown {
+          color: #000000 !important;
+          font-weight: 500;
+      }
+
+      /* Section headers - black bold */
+      h1 { color: #000000 !important; font-weight: 800; font-size: 2rem; }
+      h2 { color: #003366 !important; font-weight: 700; }
+      h3, h4 { color: #004080 !important; font-weight: 700; }
+      
+      /* Text colors - pure black */
+      p, span, label, .stMarkdown { color: #000000 !important; }
+      
+      /* Links - bright blue */
+      a { color: #0055cc !important; font-weight: 600; text-decoration: underline; }
+
+      /* Status badges - vivid saturated colors */
+      .badge-buy  { background:#00cc44; color:#ffffff; padding:5px 14px; border-radius:20px; font-weight:800; font-size:.85rem; box-shadow: 0 2px 8px rgba(0,200,68,0.4); }
+      .badge-sell { background:#ee0000; color:#ffffff; padding:5px 14px; border-radius:20px; font-weight:800; font-size:.85rem; box-shadow: 0 2px 8px rgba(238,0,0,0.4); }
+      .badge-hold { background:#ff9900; color:#000000; padding:5px 14px; border-radius:20px; font-weight:800; font-size:.85rem; box-shadow: 0 2px 8px rgba(255,153,0,0.4); }
+      
+      /* Info boxes - bright with strong border */
+      [data-testid="stAlert"] {
+          background-color: #e8f4ff !important;
+          border: 3px solid #0088ff !important;
+          border-radius: 12px;
+          color: #000000 !important;
+      }
+      [data-testid="stAlert"] p { color: #000000 !important; }
+      
+      /* Expander - blue header */
+      .streamlit-expanderHeader, details summary { 
+          background-color: #d0e4f7 !important;
+          color: #003366 !important;
+          border-radius: 10px;
+          border: 2px solid #0066cc;
+          font-weight: 700;
+      }
+      details summary span { color: #003366 !important; font-weight: 700; }
+      details[open] { 
+          background-color: #f0f7ff !important;
+          border-radius: 10px;
+      }
+      
+      /* Inputs - white with blue border */
+      .stTextInput input, 
+      .stNumberInput input,
+      .stTextArea textarea,
+      .stSelectbox [data-baseweb="select"] > div {
+          background-color: #ffffff !important;
+          color: #000000 !important;
+          border: 3px solid #0088cc !important;
+          border-radius: 10px;
+          font-weight: 500;
+      }
+      .stTextInput input:focus, .stNumberInput input:focus {
+          border-color: #0044aa !important;
+          box-shadow: 0 0 0 4px rgba(0, 102, 204, 0.25) !important;
+      }
+      .stTextInput label,
+      .stSelectbox label,
+      .stNumberInput label {
+          color: #003366 !important;
+          font-weight: 700;
+          font-size: 0.9rem;
+      }
+      
+      /* Buttons - blue themed */
+      .stButton button {
+          background: #e8f0fa !important;
+          color: #003366 !important;
+          border: 3px solid #0066cc !important;
+          border-radius: 10px;
+          font-weight: 700;
+          padding: 8px 16px;
+      }
+      .stButton button:hover {
+          background: #0066cc !important;
+          border-color: #004499 !important;
+          color: #ffffff !important;
+      }
+      .stButton button[kind="primary"] {
+          background: #0066cc !important;
+          color: #ffffff !important;
+          border: none !important;
+          box-shadow: 0 4px 15px rgba(0, 102, 204, 0.4);
+          font-weight: 800;
+      }
+      .stButton button[kind="primary"]:hover {
+          background: #004499 !important;
+      }
+      
+      /* Dividers - blue */
+      hr { border-color: #0088cc !important; border-width: 3px; }
+      
+      /* Radio & Checkbox */
+      .stRadio label, .stCheckbox label { color: #000000 !important; font-weight: 600; }
+      .stRadio [data-baseweb="radio"] span { color: #000000 !important; }
+      
+      /* Caption - dark gray */
+      .stCaption, [data-testid="stCaptionContainer"] { color: #333333 !important; font-weight: 500; }
+      
+      /* Charts - white with border */
+      [data-testid="stPlotlyChart"] { 
+          background-color: #ffffff !important;
+          border-radius: 12px;
+          border: 2px solid #0088cc;
+          padding: 10px;
+      }
+      
+      /* Success/Error messages */
+      .stSuccess { background-color: #d4f5d4 !important; border: 2px solid #00aa00 !important; }
+      .stError { background-color: #ffd4d4 !important; border: 2px solid #dd0000 !important; }
+      .stWarning { background-color: #fff0c4 !important; border: 2px solid #cc9900 !important; }
+      
+      /* Columns */
+      [data-testid="column"] { background-color: transparent !important; }
+      
+      /* Markdown text ensure black */
+      .stMarkdown p, .stMarkdown span, .stMarkdown li { color: #000000 !important; }
+      .stMarkdown strong { color: #003366 !important; }
+      .stMarkdown code { background-color: #e8f0fa !important; color: #003366 !important; }
+      
+      /* ════════════════════════════════════════════════════════════════════════
+         RESPONSIVE - Tablet & Mobile optimizations (Light Mode)
+         ════════════════════════════════════════════════════════════════════════ */
+      
+      /* Tablet breakpoint */
+      @media (max-width: 1024px) {
+          .main .block-container { padding: 1rem 1.5rem !important; }
+          div[data-testid="metric-container"] { padding: 15px 18px; }
+          div[data-testid="metric-container"] div[data-testid="stMetricValue"] { font-size: 1.4rem; }
+          h1 { font-size: 1.6rem !important; }
+          h2 { font-size: 1.3rem !important; }
+          button[data-baseweb="tab"] { font-size: 0.8rem; padding: 8px 10px; }
+      }
+      
+      /* Mobile breakpoint */
+      @media (max-width: 768px) {
+          /* Reduce padding */
+          .main .block-container { padding: 0.5rem 0.8rem !important; }
+          
+          /* Stack columns vertically */
+          [data-testid="column"] { width: 100% !important; flex: 1 1 100% !important; }
+          
+          /* Metric cards - full width, smaller text */
+          div[data-testid="metric-container"] { 
+              padding: 12px 14px; 
+              margin-bottom: 8px;
+              border-width: 2px !important;
+          }
+          div[data-testid="metric-container"] label { font-size: 0.7rem; }
+          div[data-testid="metric-container"] div[data-testid="stMetricValue"] { font-size: 1.2rem; }
+          
+          /* Headers smaller */
+          h1 { font-size: 1.4rem !important; }
+          h2 { font-size: 1.2rem !important; }
+          h3 { font-size: 1rem !important; }
+          
+          /* Tabs - scrollable, smaller */
+          [data-baseweb="tab-list"] { 
+              overflow-x: auto; 
+              -webkit-overflow-scrolling: touch;
+              padding: 4px;
+          }
+          button[data-baseweb="tab"] { 
+              font-size: 0.7rem; 
+              padding: 6px 8px; 
+              white-space: nowrap;
+              min-width: auto;
+          }
+          
+          /* Sidebar - hide or minimize */
+          section[data-testid="stSidebar"] { 
+              width: 260px !important; 
+          }
+          
+          /* Buttons - full width on mobile */
+          .stButton button { 
+              width: 100% !important; 
+              padding: 12px !important;
+              font-size: 0.9rem;
+          }
+          
+          /* DataFrames - scroll horizontally */
+          .stDataFrame { overflow-x: auto !important; }
+          
+          /* Charts - reduce height */
+          [data-testid="stPlotlyChart"] { min-height: 250px !important; }
+          
+          /* Info boxes */
+          [data-testid="stAlert"] { 
+              padding: 10px !important; 
+              font-size: 0.85rem;
+          }
+          
+          /* Input fields - larger touch targets */
+          .stTextInput input, 
+          .stNumberInput input,
+          .stSelectbox [data-baseweb="select"] > div {
+              min-height: 44px !important;
+              font-size: 16px !important; /* Prevents zoom on iOS */
+          }
+      }
+      
+      /* Small mobile */
+      @media (max-width: 480px) {
+          .main .block-container { padding: 0.3rem 0.5rem !important; }
+          h1 { font-size: 1.2rem !important; }
+          h2 { font-size: 1.05rem !important; }
+          div[data-testid="metric-container"] div[data-testid="stMetricValue"] { font-size: 1rem; }
+          button[data-baseweb="tab"] { font-size: 0.65rem; padding: 5px 6px; }
+      }
+    </style>
+    """
+
+st.markdown(theme_css, unsafe_allow_html=True)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -139,6 +679,292 @@ def get_current_price(ticker: str) -> float:
         return price if price > 0 else 0.0
     except Exception:
         return 0.0
+
+
+# ── YouTube Video Analysis ────────────────────────────────────────────────────
+# Complete list of popular stock tickers to detect
+KNOWN_TICKERS = {
+    # Mega caps & popular
+    "AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "NVDA", "META", "TSLA", "BRK.A", "BRK.B",
+    "JPM", "JNJ", "V", "UNH", "HD", "PG", "MA", "DIS", "PYPL", "NFLX", "ADBE", "CRM",
+    "INTC", "AMD", "CSCO", "PEP", "KO", "NKE", "MCD", "WMT", "COST", "ABBV", "MRK",
+    "PFE", "TMO", "AVGO", "ACN", "LLY", "ORCL", "TXN", "QCOM", "UPS", "HON", "IBM",
+    "GE", "CAT", "BA", "MMM", "GS", "AXP", "MS", "BLK", "SCHW", "C", "WFC", "BAC",
+    # Growth & tech
+    "PLTR", "SNOW", "CRWD", "ZS", "DDOG", "NET", "PANW", "OKTA", "MDB", "U", "RBLX",
+    "COIN", "HOOD", "SOFI", "AFRM", "UPST", "SQ", "SHOP", "MELI", "SE", "BABA", "JD",
+    "PDD", "NIO", "XPEV", "LI", "RIVN", "LCID", "F", "GM", "TM", "UBER", "LYFT",
+    # AI & Semiconductors
+    "ARM", "SMCI", "MRVL", "MU", "LRCX", "KLAC", "AMAT", "ASML", "TSM", "ON", "ADI",
+    # Energy & commodities
+    "XOM", "CVX", "COP", "SLB", "OXY", "DVN", "HAL", "BP", "SHEL", "TTE",
+    # Healthcare & biotech
+    "MRNA", "BNTX", "REGN", "VRTX", "GILD", "BIIB", "ILMN", "DXCM", "ISRG", "ZTS",
+    # Financials & REITs
+    "BX", "KKR", "APO", "SPGI", "MCO", "ICE", "CME", "NDAQ", "AMT", "PLD", "EQIX",
+    # Consumer & retail
+    "LULU", "TGT", "LOW", "TJX", "ROST", "DG", "DLTR", "SBUX", "CMG", "YUM", "QSR",
+    # Misc popular
+    "SPOT", "ZM", "DOCU", "TWLO", "TTD", "ROKU", "ABNB", "DASH", "DKNG", "PENN",
+    "GME", "AMC", "BB", "BBBY", "SPCE", "PLUG", "FCEL", "BLNK", "CHPT", "QS",
+    # Crypto related
+    "MSTR", "MARA", "RIOT", "CLSK", "HUT", "BITF", "HIVE",
+    # ETFs (popular ones)
+    "SPY", "QQQ", "IWM", "DIA", "VOO", "VTI", "ARKK", "ARKG", "XLF", "XLE", "XLK",
+}
+
+# Company name to ticker mapping
+COMPANY_TO_TICKER = {
+    "apple": "AAPL", "microsoft": "MSFT", "google": "GOOGL", "alphabet": "GOOGL",
+    "amazon": "AMZN", "nvidia": "NVDA", "meta": "META", "facebook": "META",
+    "tesla": "TSLA", "netflix": "NFLX", "disney": "DIS", "paypal": "PYPL",
+    "adobe": "ADBE", "salesforce": "CRM", "intel": "INTC", "amd": "AMD",
+    "cisco": "CSCO", "pepsi": "PEP", "pepsico": "PEP", "coca cola": "KO",
+    "coke": "KO", "nike": "NKE", "mcdonald": "MCD", "mcdonalds": "MCD",
+    "walmart": "WMT", "costco": "COST", "palantir": "PLTR", "snowflake": "SNOW",
+    "crowdstrike": "CRWD", "cloudflare": "NET", "coinbase": "COIN", "robinhood": "HOOD",
+    "sofi": "SOFI", "shopify": "SHOP", "alibaba": "BABA", "nio": "NIO",
+    "rivian": "RIVN", "lucid": "LCID", "ford": "F", "uber": "UBER",
+    "supermicro": "SMCI", "super micro": "SMCI", "micron": "MU", "broadcom": "AVGO",
+    "exxon": "XOM", "chevron": "CVX", "moderna": "MRNA", "pfizer": "PFE",
+    "johnson and johnson": "JNJ", "j&j": "JNJ", "berkshire": "BRK.B",
+    "jp morgan": "JPM", "jpmorgan": "JPM", "goldman sachs": "GS", "goldman": "GS",
+    "morgan stanley": "MS", "blackrock": "BLK", "visa": "V", "mastercard": "MA",
+    "american express": "AXP", "amex": "AXP", "bank of america": "BAC",
+    "wells fargo": "WFC", "citigroup": "C", "citi": "C", "gamestop": "GME",
+    "amc": "AMC", "starbucks": "SBUX", "chipotle": "CMG", "spotify": "SPOT",
+    "zoom": "ZM", "docusign": "DOCU", "airbnb": "ABNB", "doordash": "DASH",
+    "draftkings": "DKNG", "microstrategy": "MSTR", "arm": "ARM", "arm holdings": "ARM",
+    "oracle": "ORCL", "ibm": "IBM", "boeing": "BA", "caterpillar": "CAT",
+    "general electric": "GE", "home depot": "HD", "target": "TGT", "lowes": "LOW",
+    "lowe's": "LOW", "best buy": "BBY", "roku": "ROKU", "datadog": "DDOG",
+    "mongodb": "MDB", "unity": "U", "roblox": "RBLX", "twilio": "TWLO",
+    "asml": "ASML", "taiwan semiconductor": "TSM", "tsmc": "TSM",
+    "spy": "SPY", "qqq": "QQQ", "ark": "ARKK", "s&p 500": "SPY", "s&p": "SPY",
+    "nasdaq": "QQQ", "dow jones": "DIA", "dow": "DIA",
+}
+
+
+def extract_video_id(url: str) -> str:
+    """Extract YouTube video ID from various URL formats."""
+    patterns = [
+        r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/|youtube\.com/v/)([a-zA-Z0-9_-]{11})',
+        r'^([a-zA-Z0-9_-]{11})$'  # Just the ID
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return ""
+
+
+@st.cache_data(ttl=3600)  # Cache for 1 hour
+def get_youtube_transcript(video_id: str) -> tuple[str, str]:
+    """Fetch YouTube video transcript. Returns (transcript_text, error_message)."""
+    try:
+        # New API: create instance and use fetch method
+        api = YouTubeTranscriptApi()
+        
+        # Try to list available transcripts first
+        try:
+            transcript_list = api.list(video_id)
+            
+            # Find best transcript (prefer English, then any)
+            best_transcript = None
+            preferred_langs = ['en', 'en-US', 'en-GB', 'nl', 'de', 'fr']
+            
+            for transcript in transcript_list:
+                if transcript.language_code in preferred_langs:
+                    best_transcript = transcript
+                    break
+            
+            # If no preferred language found, use first available
+            if not best_transcript and transcript_list:
+                best_transcript = transcript_list[0]
+            
+            if best_transcript:
+                # Fetch the transcript content
+                fetched = best_transcript.fetch()
+                full_text = " ".join([snippet.text for snippet in fetched])
+                return full_text, ""
+        except Exception:
+            pass
+        
+        # Fallback: direct fetch (auto-selects best transcript)
+        fetched = api.fetch(video_id)
+        full_text = " ".join([snippet.text for snippet in fetched])
+        return full_text, ""
+        
+    except TranscriptsDisabled:
+        return "", "Transcripts zijn uitgeschakeld voor deze video"
+    except NoTranscriptFound:
+        return "", "Geen transcript gevonden voor deze video"
+    except Exception as e:
+        return "", f"Fout bij ophalen transcript: {str(e)}"
+
+
+def detect_stocks_in_text(text: str) -> list[dict]:
+    """Detect stock tickers and company names in text, with sentiment analysis."""
+    detected = []
+    text_lower = text.lower()
+    text_upper = text.upper()
+    
+    # 1. Direct ticker detection (e.g., "AAPL", "$TSLA", "ticker: NVDA")
+    # Pattern matches standalone tickers (with optional $ prefix)
+    ticker_patterns = [
+        r'\$([A-Z]{2,5})\b',  # $AAPL
+        r'\b([A-Z]{2,5})\s+stock\b',  # AAPL stock
+        r'\bstock\s+([A-Z]{2,5})\b',  # stock AAPL
+        r'\bticker[:\s]+([A-Z]{2,5})\b',  # ticker: AAPL
+        r'\b([A-Z]{2,5})\s+shares\b',  # AAPL shares
+    ]
+    
+    found_tickers = set()
+    
+    for pattern in ticker_patterns:
+        matches = re.findall(pattern, text_upper, re.IGNORECASE)
+        for match in matches:
+            ticker = match.upper()
+            if ticker in KNOWN_TICKERS and ticker not in found_tickers:
+                found_tickers.add(ticker)
+    
+    # Also check for standalone tickers mentioned multiple times
+    words = re.findall(r'\b([A-Z]{2,5})\b', text_upper)
+    word_counts = {}
+    for word in words:
+        if word in KNOWN_TICKERS:
+            word_counts[word] = word_counts.get(word, 0) + 1
+    
+    # Add tickers mentioned 2+ times
+    for ticker, count in word_counts.items():
+        if count >= 2 and ticker not in found_tickers:
+            found_tickers.add(ticker)
+    
+    # 2. Company name detection
+    for company, ticker in COMPANY_TO_TICKER.items():
+        if company in text_lower and ticker not in found_tickers:
+            # Check it's mentioned as a word (not part of another word)
+            pattern = r'\b' + re.escape(company) + r'\b'
+            if re.search(pattern, text_lower):
+                found_tickers.add(ticker)
+    
+    # 3. Sentiment analysis per ticker
+    # Find context around each ticker mention with IMPROVED detection
+    
+    # Weighted sentiment words (stronger words = higher weight)
+    # Optimized for finance YouTuber language (Meet Kevin, Graham Stephan, Jeremy, etc.)
+    bullish_signals = {
+        # Very strong bullish (weight 3)
+        'bought heavy': 3, 'buying heavy': 3, 'loading up': 3, 'loaded up': 3,
+        'adding aggressively': 3, 'very bullish': 3, 'extremely bullish': 3,
+        'my favorite': 3, 'top pick': 3, 'strong buy': 3, 'must buy': 3,
+        'no brainer': 3, 'slam dunk': 3, 'huge opportunity': 3,
+        'always a buy': 3, 'generational buy': 3, 'life changing': 3,
+        'doubled down': 3, 'tripled down': 3, 'all in': 3,
+        'best stock': 3, 'best investment': 3, 'can\'t go wrong': 3,
+        # Strong bullish (weight 2)
+        'bought': 2, 'buying': 2, 'added': 2, 'adding': 2, 'accumulating': 2,
+        'bullish': 2, 'long term buy': 2, 'great opportunity': 2, 'undervalued': 2,
+        'love this': 2, 'love the': 2, 'i love': 2, 'really like': 2,
+        'going higher': 2, 'will recover': 2, 'bottom is in': 2, 'bottoming': 2,
+        'cheap': 2, 'discount': 2, 'on sale': 2, 'steal': 2,
+        'picked up': 2, 'scooped up': 2, 'grabbed': 2, 'snapped up': 2,
+        'backing up the truck': 2, 'fire sale': 2, 'blood in the streets': 2,
+        'long term hold': 2, 'hold forever': 2, 'never sell': 2,
+        'conviction': 2, 'high conviction': 2, 'confident': 2,
+        # Moderate bullish (weight 1)
+        'buy': 1, 'long': 1, 'calls': 1, 'upside': 1, 'growth': 1,
+        'opportunity': 1, 'potential': 1, 'promising': 1, 'strong': 1,
+        'rally': 1, 'breakout': 1, 'recovery': 1, 'rebound': 1,
+        'like': 1, 'positive': 1, 'optimistic': 1, 'excited': 1,
+        'oversold': 1, 'beaten down': 2, 'pullback': 1, 'dip': 1,
+    }
+    
+    bearish_signals = {
+        # Very strong bearish (weight 3)
+        'sold everything': 3, 'selling everything': 3, 'avoid at all costs': 3,
+        'very bearish': 3, 'extremely bearish': 3, 'stay away': 3,
+        'disaster': 3, 'terrible': 3, 'worst': 3,
+        'would never buy': 3, 'dead money': 3, 'going to zero': 3,
+        # Strong bearish (weight 2)
+        'sold': 2, 'selling': 2, 'reduced': 2, 'trimmed': 2,
+        'bearish': 2, 'overvalued': 2, 'too expensive': 2, 'bubble': 2,
+        'avoid': 2, 'stay away': 2, 'concerned': 2, 'worried': 2,
+        'going lower': 2, 'will crash': 2, 'will drop': 2,
+        # Moderate bearish (weight 1)
+        'sell': 1, 'short': 1, 'puts': 1, 'downside': 1, 'risk': 1,
+        'weak': 1, 'struggling': 1, 'problems': 1, 'issues': 1,
+        'dump': 1, 'drop': 1, 'crash': 1, 'plunge': 1,
+        'negative': 1, 'pessimistic': 1, 'cautious': 1,
+    }
+    
+    for ticker in found_tickers:
+        # Find ALL context windows around ticker mentions (larger window: 300 chars)
+        ticker_positions = [m.start() for m in re.finditer(r'\b' + ticker + r'\b', text_upper)]
+        
+        # Also find positions of company name if applicable
+        company_name = None
+        for company, t in COMPANY_TO_TICKER.items():
+            if t == ticker:
+                company_name = company
+                break
+        
+        if company_name:
+            company_positions = [m.start() for m in re.finditer(r'\b' + re.escape(company_name) + r'\b', text_lower)]
+            ticker_positions.extend(company_positions)
+        
+        total_bullish_score = 0
+        total_bearish_score = 0
+        best_context = ""
+        
+        for pos in ticker_positions:
+            start = max(0, pos - 300)
+            end = min(len(text_lower), pos + 300)
+            context = text_lower[start:end]
+            
+            # Calculate weighted scores
+            bullish_score = sum(weight for phrase, weight in bullish_signals.items() if phrase in context)
+            bearish_score = sum(weight for phrase, weight in bearish_signals.items() if phrase in context)
+            
+            total_bullish_score += bullish_score
+            total_bearish_score += bearish_score
+            
+            # Keep best context (one with most signal)
+            if bullish_score + bearish_score > 0:
+                best_context = context
+        
+        # Determine sentiment based on total weighted scores
+        sentiment = "🟡 Neutral"
+        if total_bullish_score > total_bearish_score + 1:  # Need clear advantage
+            sentiment = "🟢 Bullish"
+        elif total_bearish_score > total_bullish_score + 1:
+            sentiment = "🔴 Bearish"
+        
+        # Get current price
+        current_price = get_current_price(ticker)
+        
+        # Clean up context for display
+        if best_context:
+            # Find the most relevant sentence
+            sentences = best_context.split('.')
+            relevant_sentence = max(sentences, key=len) if sentences else best_context
+            context_display = relevant_sentence.strip()[:150]
+        else:
+            context_display = ""
+        
+        detected.append({
+            "ticker": ticker,
+            "sentiment": sentiment,
+            "price": current_price,
+            "context": context_display + "..." if context_display else "",
+            "bullish_score": total_bullish_score,
+            "bearish_score": total_bearish_score,
+        })
+    
+    # Sort by ticker
+    detected = sorted(detected, key=lambda x: x["ticker"])
+    
+    return detected
 
 
 def calculate_fair_value(df: pd.DataFrame, current_price: float, ticker: str) -> dict:
@@ -1408,6 +2234,17 @@ with st.sidebar:
     )
     st.title("📊 Stock Dashboard")
     st.caption(f"Last refresh: {datetime.now().strftime('%d %b %Y  %H:%M')}")
+    
+    # Theme toggle
+    theme_cols = st.columns([1, 1])
+    with theme_cols[0]:
+        if st.button("🌙 Nacht" if st.session_state.theme == "light" else "☀️ Dag", use_container_width=True):
+            st.session_state.theme = "dark" if st.session_state.theme == "light" else "light"
+            st.rerun()
+    with theme_cols[1]:
+        current_theme = "🌙 Dark" if st.session_state.theme == "dark" else "☀️ Light"
+        st.caption(f"Mode: {current_theme}")
+    
     st.divider()
 
     # --- Login / User Selection ---
@@ -1652,7 +2489,7 @@ def latest(ticker: str, col: str) -> float:
 
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12 = st.tabs([
     "📁 Portfolio Overzicht", 
     "👁️ Watchlist", 
     "📊 Analytics", 
@@ -1663,7 +2500,8 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
     "💰 Income & Compare",
     "🔔 Price Alerts",
     "📈 History & Export",
-    "🧮 Position Calculator"
+    "🧮 Position Calculator",
+    "🎬 YouTuber Picks"
 ])
 
 
@@ -1672,6 +2510,11 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
 # ════════════════════════════════════════════════════════════════════════════
 with tab1:
     st.header("Portfolio Overzicht")
+    st.info("""
+    📁 **Wat zie je hier?**  
+    Een compleet overzicht van al je stocks met actuele prijzen, winst/verlies per positie, 
+    Fair Value berekening en BUY/HOLD/SELL signalen. Inclusief sector verdeling en visualisaties.
+    """)
 
     if not portfolio_positions:
         st.info("Voeg posities toe in de zijbalk (TICKER, AANTAL, GAK).")
@@ -1914,69 +2757,435 @@ with tab1:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TAB 2 – Watchlist
+# TAB 2 – Watchlist (Enhanced)
 # ════════════════════════════════════════════════════════════════════════════
 with tab2:
-    st.header("Watchlist Analyse")
+    st.header("👁️ Watchlist Analyse Pro")
+    st.info("""
+    👁️ **Uitgebreide Watchlist Analyse**  
+    Complete analyse van stocks die je volgt: Fair Value, technische indicatoren, 52-week range,
+    volume analyse, performance metrics, entry/exit targets en buy priority ranking.
+    """)
 
     if not watchlist_tickers:
         st.info("Voeg tickers toe in de zijbalk (komma-gescheiden).")
     else:
+        # Build comprehensive watchlist data
         wl_rows = []
         for t in watchlist_tickers:
-            price  = latest(t, "Close")
-            rsi    = latest(t, "RSI")
-            sma    = latest(t, "SMA200")
             df = ticker_data.get(t, pd.DataFrame())
+            if df.empty:
+                continue
+                
+            price = latest(t, "Close")
+            rsi = latest(t, "RSI")
+            sma200 = latest(t, "SMA200")
+            sma50 = latest(t, "SMA50") if "SMA50" in df.columns else float("nan")
+            macd = latest(t, "MACD_12_26_9") if "MACD_12_26_9" in df.columns else float("nan")
+            macd_signal = latest(t, "MACDs_12_26_9") if "MACDs_12_26_9" in df.columns else float("nan")
+            
+            # Fair value
             fair_val = calculate_fair_value(df, price, t)
-            trend  = "🟢 Bullish" if (not pd.isna(sma) and price > sma) else "🔴 Bearish"
-            signal = classify_status(price, sma, rsi, df, fair_val["fair_value"])
+            fv = fair_val["fair_value"]
+            discount_pct = ((fv - price) / price * 100) if price and fv else 0
+            
+            # 52-week high/low
+            high_52w = df["High"].tail(252).max() if len(df) >= 252 else df["High"].max()
+            low_52w = df["Low"].tail(252).min() if len(df) >= 252 else df["Low"].min()
+            pct_from_high = ((price - high_52w) / high_52w * 100) if high_52w else 0
+            pct_from_low = ((price - low_52w) / low_52w * 100) if low_52w else 0
+            range_position = ((price - low_52w) / (high_52w - low_52w) * 100) if (high_52w - low_52w) > 0 else 50
+            
+            # Performance
+            change_1d = ((price - df["Close"].iloc[-2]) / df["Close"].iloc[-2] * 100) if len(df) >= 2 else 0
+            change_1w = ((price - df["Close"].iloc[-5]) / df["Close"].iloc[-5] * 100) if len(df) >= 5 else 0
+            change_1m = ((price - df["Close"].iloc[-21]) / df["Close"].iloc[-21] * 100) if len(df) >= 21 else 0
+            change_3m = ((price - df["Close"].iloc[-63]) / df["Close"].iloc[-63] * 100) if len(df) >= 63 else 0
+            
+            # Volume analysis
+            avg_vol = df["Volume"].tail(20).mean() if "Volume" in df.columns else 0
+            current_vol = df["Volume"].iloc[-1] if "Volume" in df.columns else 0
+            vol_ratio = (current_vol / avg_vol) if avg_vol > 0 else 1
+            unusual_vol = vol_ratio > 1.5
+            
+            # Bollinger Bands position
+            bb_upper = latest(t, "BBU_20_2.0") if "BBU_20_2.0" in df.columns else float("nan")
+            bb_lower = latest(t, "BBL_20_2.0") if "BBL_20_2.0" in df.columns else float("nan")
+            bb_position = "middle"
+            if not pd.isna(bb_upper) and not pd.isna(bb_lower):
+                if price >= bb_upper * 0.98:
+                    bb_position = "upper"
+                elif price <= bb_lower * 1.02:
+                    bb_position = "lower"
+            
+            # Trend & signals
+            trend = "🟢 Bullish" if (not pd.isna(sma200) and price > sma200) else "🔴 Bearish"
+            signal = classify_status(price, sma200, rsi, df, fv)
+            
+            # MACD signal
+            macd_trend = "bullish" if (not pd.isna(macd) and not pd.isna(macd_signal) and macd > macd_signal) else "bearish"
+            
+            # Get ticker info
+            info = fetch_ticker_info(t)
+            sector = info.get("sector", "N/A")
+            industry = info.get("industry", "N/A")
+            div_yield = info.get("dividendYield", 0) or 0
+            
+            # Calculate buy priority score (0-100)
+            buy_score = 50  # Base score
+            # RSI contribution
+            if not pd.isna(rsi):
+                if rsi < 30:
+                    buy_score += 20
+                elif rsi < 40:
+                    buy_score += 10
+                elif rsi > 70:
+                    buy_score -= 15
+            # Discount contribution
+            if discount_pct > 20:
+                buy_score += 20
+            elif discount_pct > 10:
+                buy_score += 10
+            elif discount_pct < -10:
+                buy_score -= 10
+            # Trend contribution
+            if trend == "🟢 Bullish":
+                buy_score += 5
+            # MACD contribution
+            if macd_trend == "bullish":
+                buy_score += 5
+            # BB position
+            if bb_position == "lower":
+                buy_score += 10
+            elif bb_position == "upper":
+                buy_score -= 10
+            # Volume surge (could indicate breakout)
+            if unusual_vol and change_1d > 0:
+                buy_score += 5
+            
+            buy_score = max(0, min(100, buy_score))  # Clamp to 0-100
+            
+            # Entry/Exit targets
+            entry_target = price * 0.95 if signal != "BUY" else price  # Buy at 5% discount unless already BUY
+            exit_target = fv if fv > price else price * 1.15  # Fair value or 15% gain
+            
             wl_rows.append({
                 "Ticker": t,
-                "Prijs": price,
+                "Price": price,
+                "Fair_Value": fv,
+                "Discount_Pct": discount_pct,
                 "RSI": rsi,
-                "SMA200": sma,
+                "SMA50": sma50,
+                "SMA200": sma200,
+                "MACD": macd,
+                "MACD_Signal": macd_signal,
+                "MACD_Trend": macd_trend,
                 "Trend": trend,
-                "Signaal": signal,
+                "Signal": signal,
+                "High_52w": high_52w,
+                "Low_52w": low_52w,
+                "Pct_From_High": pct_from_high,
+                "Range_Position": range_position,
+                "Change_1D": change_1d,
+                "Change_1W": change_1w,
+                "Change_1M": change_1m,
+                "Change_3M": change_3m,
+                "Vol_Ratio": vol_ratio,
+                "Unusual_Vol": unusual_vol,
+                "BB_Position": bb_position,
+                "Sector": sector,
+                "Industry": industry,
+                "Div_Yield": div_yield,
+                "Buy_Score": buy_score,
+                "Entry_Target": entry_target,
+                "Exit_Target": exit_target,
+                "Valuation": fair_val["valuation"],
             })
-
-        # Render watchlist cards
-        for r in wl_rows:
-            signal_emoji = "🟢" if r["Signaal"] == "BUY" else ("🔴" if r["Signaal"] == "SELL" else "🟡")
-            oversold = r["Signaal"] == "BUY"
-            border_color = "#3fb950" if oversold else ("#f85149" if r["Signaal"] == "SELL" else "#2e3140")
-            bg_color     = "#0d2318" if oversold else ("#1a0d0d" if r["Signaal"] == "SELL" else "#1c1f26")
-            rsi_raw   = float(r["RSI"]) if not pd.isna(r["RSI"]) else float("nan")
-            prijs_raw = float(r["Prijs"]) if not pd.isna(r["Prijs"]) else float("nan")
-            rsi_val   = f"{rsi_raw:.1f}" if not pd.isna(rsi_raw) else "N/A"
-            rsi_color = ("#3fb950" if (not pd.isna(rsi_raw) and rsi_raw < 35) else
-                         ("#f85149" if (not pd.isna(rsi_raw) and rsi_raw > 65) else "#e3b341"))
-            prijs_str = f"{prijs_raw:,.2f}" if not pd.isna(prijs_raw) else "N/A"
-
-            with st.container():
-                st.markdown(
-                    f"""
-                    <div style="
-                        background:{bg_color};
-                        border:1.5px solid {border_color};
-                        border-radius:12px;
-                        padding:14px 20px;
-                        margin-bottom:10px;
-                    ">
-                      <span style="font-size:1.15rem; font-weight:700; color:#e6edf3">{r['Ticker']}</span>
-                      &nbsp;&nbsp;
-                      <span style="color:#8b949e; font-size:.9rem">$ {prijs_str}</span>
-                      &nbsp;&nbsp;|&nbsp;&nbsp;
-                      <span style="color:#8b949e; font-size:.9rem">RSI: </span>
-                      <span style="font-weight:700; color:{rsi_color}">{rsi_val}</span>
-                      &nbsp;&nbsp;|&nbsp;&nbsp;
-                      <span style="font-size:.9rem">{r['Trend']}</span>
-                      &nbsp;&nbsp;|&nbsp;&nbsp;
-                      <span style="font-weight:700; font-size:.95rem">{signal_emoji} {r['Signaal']}</span>
+        
+        # Sort by buy score (best opportunities first)
+        wl_rows = sorted(wl_rows, key=lambda x: x["Buy_Score"], reverse=True)
+        
+        # ── Summary Metrics ──
+        st.subheader("📊 Watchlist Overview")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        buy_signals = sum(1 for r in wl_rows if r["Signal"] == "BUY")
+        sell_signals = sum(1 for r in wl_rows if r["Signal"] == "SELL")
+        undervalued = sum(1 for r in wl_rows if r["Discount_Pct"] > 10)
+        unusual_volume = sum(1 for r in wl_rows if r["Unusual_Vol"])
+        
+        col1.metric("🎯 Total Stocks", len(wl_rows))
+        col2.metric("🟢 Buy Signals", buy_signals, delta=f"+{buy_signals}" if buy_signals > 0 else None)
+        col3.metric("💰 Undervalued", undervalued, help=">10% discount to fair value")
+        col4.metric("📈 Unusual Volume", unusual_volume, help=">150% of avg volume")
+        
+        st.divider()
+        
+        # ── Buy Priority Ranking ──
+        st.subheader("🏆 Buy Priority Ranking")
+        st.caption("Ranked by score (RSI, discount, trend, MACD, volume)")
+        
+        # Responsive: show top 5 in a horizontal scrollable container for mobile
+        top_5 = wl_rows[:5]
+        
+        # Build HTML for responsive grid
+        ranking_html = '<div style="display:flex; flex-wrap:wrap; gap:10px; justify-content:center">'
+        for idx, row in enumerate(top_5):
+            score = row["Buy_Score"]
+            if score >= 70:
+                score_color = "#3fb950"
+                score_emoji = "🔥"
+            elif score >= 50:
+                score_color = "#e3b341"
+                score_emoji = "✨"
+            else:
+                score_color = "#8b949e"
+                score_emoji = "📊"
+            
+            ranking_html += f'''
+            <div style="flex:1 1 100px; min-width:80px; max-width:150px; text-align:center; padding:10px 8px; background:#1c1f26; border-radius:10px; border:2px solid {score_color}">
+                <div style="font-size:clamp(1rem, 4vw, 1.5rem); font-weight:800; color:{score_color}">{idx+1}</div>
+                <div style="font-size:clamp(0.9rem, 3vw, 1.2rem); font-weight:700; color:#e6edf3">{row['Ticker']}</div>
+                <div style="font-size:clamp(1.2rem, 5vw, 2rem)">{score_emoji}</div>
+                <div style="font-size:clamp(0.8rem, 2.5vw, 1.1rem); color:{score_color}">{score}</div>
+            </div>
+            '''
+        ranking_html += '</div>'
+        
+        st.markdown(ranking_html, unsafe_allow_html=True)
+        
+        st.divider()
+        
+        # ── Detailed Analysis Cards ──
+        st.subheader("📋 Detailed Stock Analysis")
+        
+        # View mode toggle
+        view_mode = st.radio("View Mode", ["Cards", "Table"], horizontal=True, key="wl_view_mode")
+        
+        if view_mode == "Table":
+            # Table view
+            table_data = []
+            for r in wl_rows:
+                table_data.append({
+                    "🏆": f"{r['Buy_Score']}/100",
+                    "Ticker": r["Ticker"],
+                    "Price": f"${r['Price']:.2f}",
+                    "Fair Value": f"${r['Fair_Value']:.2f}",
+                    "Discount": f"{r['Discount_Pct']:+.1f}%",
+                    "RSI": f"{r['RSI']:.1f}" if not pd.isna(r['RSI']) else "N/A",
+                    "Signal": r["Signal"],
+                    "Trend": r["Trend"],
+                    "1D": f"{r['Change_1D']:+.1f}%",
+                    "1W": f"{r['Change_1W']:+.1f}%",
+                    "1M": f"{r['Change_1M']:+.1f}%",
+                    "Entry": f"${r['Entry_Target']:.2f}",
+                    "Target": f"${r['Exit_Target']:.2f}",
+                })
+            st.dataframe(table_data, use_container_width=True, hide_index=True)
+        
+        else:
+            # Card view (detailed)
+            for r in wl_rows:
+                # Determine card styling based on signal
+                if r["Signal"] == "BUY":
+                    border_color = "#3fb950"
+                    bg_color = "#0d2318"
+                elif r["Signal"] == "SELL":
+                    border_color = "#f85149"
+                    bg_color = "#1a0d0d"
+                else:
+                    border_color = "#2e3140"
+                    bg_color = "#1c1f26"
+                
+                # Buy score badge color
+                score = r["Buy_Score"]
+                if score >= 70:
+                    score_color = "#3fb950"
+                elif score >= 50:
+                    score_color = "#e3b341"
+                else:
+                    score_color = "#8b949e"
+                
+                st.markdown(f"""
+                <div style="
+                    background:{bg_color};
+                    border:2px solid {border_color};
+                    border-radius:16px;
+                    padding:15px;
+                    margin-bottom:15px;
+                ">
+                    <!-- Header Row - responsive flex wrap -->
+                    <div style="display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; margin-bottom:12px; gap:10px">
+                        <div style="display:flex; flex-wrap:wrap; align-items:center; gap:8px">
+                            <span style="font-size:clamp(1.1rem, 4vw, 1.5rem); font-weight:800; color:#e6edf3">{r['Ticker']}</span>
+                            <span style="padding:4px 10px; background:{score_color}; border-radius:20px; font-weight:700; color:#000; font-size:0.8rem">
+                                {score}/100
+                            </span>
+                        </div>
+                        <div style="text-align:right">
+                            <span style="font-size:clamp(1rem, 3.5vw, 1.3rem); font-weight:700; color:#58a6ff">${r['Price']:.2f}</span>
+                            <span style="margin-left:8px; font-size:0.75rem; color:#8b949e">{r['Sector'][:15]}</span>
+                        </div>
                     </div>
-                    """,
-                    unsafe_allow_html=True,
+                    
+                    <!-- Metrics Grid - auto-responsive 2-3-6 columns -->
+                    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(80px, 1fr)); gap:8px; margin-bottom:12px">
+                        <div style="text-align:center; padding:6px; background:#161b22; border-radius:8px">
+                            <div style="font-size:0.65rem; color:#8b949e">Fair Val</div>
+                            <div style="font-size:0.85rem; font-weight:700; color:#58a6ff">${r['Fair_Value']:.2f}</div>
+                        </div>
+                        <div style="text-align:center; padding:6px; background:#161b22; border-radius:8px">
+                            <div style="font-size:0.65rem; color:#8b949e">Discount</div>
+                            <div style="font-size:0.85rem; font-weight:700; color:{'#3fb950' if r['Discount_Pct'] > 0 else '#f85149'}">{r['Discount_Pct']:+.1f}%</div>
+                        </div>
+                        <div style="text-align:center; padding:6px; background:#161b22; border-radius:8px">
+                            <div style="font-size:0.65rem; color:#8b949e">RSI</div>
+                            <div style="font-size:0.85rem; font-weight:700; color:{'#3fb950' if r['RSI'] < 35 else '#f85149' if r['RSI'] > 65 else '#e3b341'}">{r['RSI']:.1f}</div>
+                        </div>
+                        <div style="text-align:center; padding:6px; background:#161b22; border-radius:8px">
+                            <div style="font-size:0.65rem; color:#8b949e">Signal</div>
+                            <div style="font-size:0.85rem; font-weight:700; color:{'#3fb950' if r['Signal'] == 'BUY' else '#f85149' if r['Signal'] == 'SELL' else '#e3b341'}">{r['Signal']}</div>
+                        </div>
+                        <div style="text-align:center; padding:6px; background:#161b22; border-radius:8px">
+                            <div style="font-size:0.65rem; color:#8b949e">MACD</div>
+                            <div style="font-size:0.85rem; font-weight:700; color:{'#3fb950' if r['MACD_Trend'] == 'bullish' else '#f85149'}">{'📈' if r['MACD_Trend'] == 'bullish' else '📉'}</div>
+                        </div>
+                        <div style="text-align:center; padding:6px; background:#161b22; border-radius:8px">
+                            <div style="font-size:0.65rem; color:#8b949e">Volume</div>
+                            <div style="font-size:0.85rem; font-weight:700; color:{'#e3b341' if r['Unusual_Vol'] else '#8b949e'}">{r['Vol_Ratio']:.1f}x{'🔥' if r['Unusual_Vol'] else ''}</div>
+                        </div>
+                    </div>
+                    
+                    <!-- Performance Row - auto-responsive -->
+                    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(60px, 1fr)); gap:6px; margin-bottom:12px">
+                        <div style="text-align:center; padding:5px; background:#0d1117; border-radius:6px">
+                            <span style="font-size:0.65rem; color:#8b949e">1D </span>
+                            <span style="font-weight:700; font-size:0.8rem; color:{'#3fb950' if r['Change_1D'] >= 0 else '#f85149'}">{r['Change_1D']:+.1f}%</span>
+                        </div>
+                        <div style="text-align:center; padding:5px; background:#0d1117; border-radius:6px">
+                            <span style="font-size:0.65rem; color:#8b949e">1W </span>
+                            <span style="font-weight:700; font-size:0.8rem; color:{'#3fb950' if r['Change_1W'] >= 0 else '#f85149'}">{r['Change_1W']:+.1f}%</span>
+                        </div>
+                        <div style="text-align:center; padding:5px; background:#0d1117; border-radius:6px">
+                            <span style="font-size:0.65rem; color:#8b949e">1M </span>
+                            <span style="font-weight:700; font-size:0.8rem; color:{'#3fb950' if r['Change_1M'] >= 0 else '#f85149'}">{r['Change_1M']:+.1f}%</span>
+                        </div>
+                        <div style="text-align:center; padding:5px; background:#0d1117; border-radius:6px">
+                            <span style="font-size:0.65rem; color:#8b949e">3M </span>
+                            <span style="font-weight:700; font-size:0.8rem; color:{'#3fb950' if r['Change_3M'] >= 0 else '#f85149'}">{r['Change_3M']:+.1f}%</span>
+                        </div>
+                    </div>
+                    
+                    <!-- 52-Week Range Bar -->
+                    <div style="margin-bottom:12px">
+                        <div style="display:flex; flex-wrap:wrap; justify-content:space-between; font-size:0.7rem; color:#8b949e; margin-bottom:4px; gap:5px">
+                            <span>Low: ${r['Low_52w']:.2f}</span>
+                            <span>52W Range</span>
+                            <span>High: ${r['High_52w']:.2f}</span>
+                        </div>
+                        <div style="background:#161b22; border-radius:10px; height:10px; position:relative">
+                            <div style="
+                                position:absolute;
+                                left:{r['Range_Position']}%;
+                                top:50%;
+                                transform:translate(-50%, -50%);
+                                width:14px;
+                                height:14px;
+                                background:{'#3fb950' if r['Range_Position'] < 30 else '#f85149' if r['Range_Position'] > 70 else '#58a6ff'};
+                                border-radius:50%;
+                                border:2px solid #e6edf3;
+                            "></div>
+                            <div style="width:{r['Range_Position']}%; height:100%; background:linear-gradient(90deg, #3fb950, #e3b341, #f85149); border-radius:10px; opacity:0.3"></div>
+                        </div>
+                        <div style="text-align:center; font-size:0.75rem; color:#e6edf3; margin-top:4px">
+                            {r['Pct_From_High']:.1f}% from High
+                        </div>
+                    </div>
+                    
+                    <!-- Entry/Exit Targets - auto-responsive -->
+                    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(90px, 1fr)); gap:10px">
+                        <div style="text-align:center; padding:8px; background:#0d2318; border:1px solid #3fb950; border-radius:10px">
+                            <div style="font-size:0.7rem; color:#8b949e">🎯 Entry</div>
+                            <div style="font-size:1rem; font-weight:700; color:#3fb950">${r['Entry_Target']:.2f}</div>
+                        </div>
+                        <div style="text-align:center; padding:8px; background:#161b22; border:1px solid #58a6ff; border-radius:10px">
+                            <div style="font-size:0.7rem; color:#8b949e">📊 Now</div>
+                            <div style="font-size:1rem; font-weight:700; color:#58a6ff">${r['Price']:.2f}</div>
+                        </div>
+                        <div style="text-align:center; padding:8px; background:#1a1d0d; border:1px solid #e3b341; border-radius:10px">
+                            <div style="font-size:0.7rem; color:#8b949e">🚀 Target</div>
+                            <div style="font-size:1rem; font-weight:700; color:#e3b341">${r['Exit_Target']:.2f}</div>
+                        </div>
+                    </div>
+                    
+                    <!-- Footer info - wrap on mobile -->
+                    <div style="margin-top:10px; font-size:0.7rem; color:#6e7681; word-wrap:break-word">
+                        {r['Trend']} | {r['Valuation'][:25]} {'| 💰 ' + f"{r['Div_Yield']*100:.1f}%" if r['Div_Yield'] > 0 else ''}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+        
+        st.divider()
+        
+        # ── Mini Charts Section ──
+        st.subheader("📈 Price Charts")
+        
+        selected_wl_ticker = st.selectbox("Select stock for detailed chart", [r["Ticker"] for r in wl_rows], key="wl_chart_select")
+        
+        if selected_wl_ticker:
+            df_chart = ticker_data.get(selected_wl_ticker, pd.DataFrame())
+            if not df_chart.empty:
+                # Create detailed chart
+                fig = go.Figure()
+                
+                # Candlestick
+                fig.add_trace(go.Candlestick(
+                    x=df_chart.index,
+                    open=df_chart['Open'],
+                    high=df_chart['High'],
+                    low=df_chart['Low'],
+                    close=df_chart['Close'],
+                    name='Price'
+                ))
+                
+                # SMA lines
+                if 'SMA50' in df_chart.columns:
+                    fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['SMA50'], name='SMA50', line=dict(color='#e3b341', width=1)))
+                if 'SMA200' in df_chart.columns:
+                    fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['SMA200'], name='SMA200', line=dict(color='#58a6ff', width=1)))
+                
+                # Bollinger Bands
+                if 'BBU_20_2.0' in df_chart.columns and 'BBL_20_2.0' in df_chart.columns:
+                    fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['BBU_20_2.0'], name='BB Upper', line=dict(color='#8b949e', width=1, dash='dash')))
+                    fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['BBL_20_2.0'], name='BB Lower', line=dict(color='#8b949e', width=1, dash='dash'), fill='tonexty', fillcolor='rgba(139,148,158,0.1)'))
+                
+                # Fair value line
+                for r in wl_rows:
+                    if r["Ticker"] == selected_wl_ticker:
+                        fig.add_hline(y=r["Fair_Value"], line_dash="dot", line_color="#bc8ef7", annotation_text=f"Fair Value: ${r['Fair_Value']:.2f}")
+                        fig.add_hline(y=r["Entry_Target"], line_dash="dot", line_color="#3fb950", annotation_text=f"Entry: ${r['Entry_Target']:.2f}")
+                        fig.add_hline(y=r["Exit_Target"], line_dash="dot", line_color="#e3b341", annotation_text=f"Target: ${r['Exit_Target']:.2f}")
+                        break
+                
+                fig.update_layout(
+                    template="plotly_dark",
+                    height=500,
+                    title=f"{selected_wl_ticker} - Price Chart with Indicators",
+                    xaxis_title="Date",
+                    yaxis_title="Price ($)",
+                    xaxis_rangeslider_visible=False
                 )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # RSI chart
+                if 'RSI' in df_chart.columns:
+                    fig_rsi = go.Figure()
+                    fig_rsi.add_trace(go.Scatter(x=df_chart.index, y=df_chart['RSI'], name='RSI', line=dict(color='#bc8ef7', width=2)))
+                    fig_rsi.add_hline(y=70, line_dash="dash", line_color="#f85149", annotation_text="Overbought")
+                    fig_rsi.add_hline(y=30, line_dash="dash", line_color="#3fb950", annotation_text="Oversold")
+                    fig_rsi.update_layout(template="plotly_dark", height=200, title="RSI Indicator", yaxis_range=[0, 100])
+                    st.plotly_chart(fig_rsi, use_container_width=True)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1984,6 +3193,11 @@ with tab2:
 # ════════════════════════════════════════════════════════════════════════════
 with tab3:
     st.header("📊 Portfolio Analytics")
+    st.info("""
+    📊 **Wat zie je hier?**  
+    Analyse van je portfolio diversificatie en risico. Bekijk sector allocatie (pie chart), 
+    totaal rendement en een risico-assessment (low/medium/high) gebaseerd op volatiliteit.
+    """)
     
     if not portfolio_positions:
         st.info("Voeg stocks toe aan je portfolio om analytics te zien.")
@@ -2051,6 +3265,11 @@ with tab3:
 # ════════════════════════════════════════════════════════════════════════════
 with tab4:
     st.header("⚙️ Advanced Technical Analysis")
+    st.info("""
+    ⚙️ **Wat zie je hier?**  
+    Diepgaande technische analyse per stock: Support/Resistance levels, volume analyse, 
+    fundamentele gezondheid (P/E, ROE, Debt/Equity, Profit Margin) en correlatie matrix tussen je stocks.
+    """)
     
     if not all_tickers:
         st.info("Voeg tickers toe om advanced analysis te zien.")
@@ -2176,6 +3395,12 @@ with tab4:
 # ════════════════════════════════════════════════════════════════════════════
 with tab5:
     st.header("🎯 Stock Aanbevelingen")
+    st.info("""
+    🎯 **Wat zie je hier?**  
+    AI-gegenereerde koopaanbevelingen uit 60+ populaire stocks. Score van 0-20 gebaseerd op:
+    Fair Value (ondergewaardeerd?), RSI (oversold?), trend, volume, en fundamentele data.
+    ✅ = je hebt deze al in portfolio.
+    """)
     
     # Get market health
     market_health = get_market_health()
@@ -2282,6 +3507,11 @@ with tab5:
 # ════════════════════════════════════════════════════════════════════════════
 with tab6:
     st.header("⚠️ Portfolio Alerts & Tax Benefits")
+    st.info("""
+    ⚠️ **Wat zie je hier?**  
+    **Alerts**: Waarschuwingen voor grote verliezen (>10%), grote winsten (>30%) en RSI extremen.  
+    **Tax Loss Harvesting**: Verliesgevende posities die je kunt verkopen voor belastingvoordeel (24% bracket).
+    """)
     
     # Alerts
     st.subheader("🚨 Active Alerts")
@@ -2327,6 +3557,11 @@ with tab6:
 # ════════════════════════════════════════════════════════════════════════════
 with tab7:
     st.header("💡 Rebalancing & Risk Management")
+    st.info("""
+    💡 **Wat zie je hier?**  
+    **Risk Metrics**: VaR (Value at Risk), Sharpe Ratio, Max Drawdown, Beta vs S&P 500.  
+    **Rebalancing**: Suggesties om je portfolio te herbalanceren naar target sector allocaties.
+    """)
     
     # Risk Metrics
     st.subheader("📊 Risk Metrics (Professional Grade)")
@@ -2412,6 +3647,11 @@ with tab7:
 # ════════════════════════════════════════════════════════════════════════════
 with tab8:
     st.header("💰 Income & Performance")
+    st.info("""
+    💰 **Wat zie je hier?**  
+    **Dividend Income**: Hoeveel dividend je jaarlijks ontvangt van je portfolio.  
+    **Benchmark**: Vergelijk je rendement met de S&P 500 - presteren je beter of slechter dan de markt?
+    """)
     
     # Dividend Income
     st.subheader("💵 Dividend Income")
@@ -2487,7 +3727,11 @@ with tab8:
 # ════════════════════════════════════════════════════════════════════════════
 with tab9:
     st.header("🔔 Price Alerts")
-    st.caption("Ontvang meldingen wanneer stocks een bepaalde prijs bereiken")
+    st.info("""
+    🔔 **Wat zie je hier?**  
+    Stel prijs alerts in voor elke stock. Kies een target prijs en of je een melding wilt 
+    wanneer de prijs **boven** (koop alert) of **onder** (stop-loss alert) de target komt.
+    """)
     
     # Load existing alerts
     price_alerts = user_data.get("price_alerts", [])
@@ -2568,6 +3812,12 @@ with tab9:
 # ════════════════════════════════════════════════════════════════════════════
 with tab10:
     st.header("📈 Portfolio History & Export")
+    st.info("""
+    📈 **Wat zie je hier?**  
+    **History**: Grafiek van je portfolio waarde over tijd (dagelijks bijgehouden).  
+    **Export**: Download je portfolio als CSV. **News**: Recente nieuwsartikelen per stock.  
+    **Earnings Calendar**: Wanneer komen earnings aan voor je stocks?
+    """)
     
     # Record today's snapshot
     portfolio_history = user_data.get("portfolio_history", [])
@@ -2733,7 +3983,12 @@ with tab10:
 # ════════════════════════════════════════════════════════════════════════════
 with tab11:
     st.header("🧮 Position Size Calculator")
-    st.caption("Bereken de juiste positiegrootte gebaseerd op risicomanagement")
+    st.info("""
+    🧮 **Wat zie je hier?**  
+    Bereken hoeveel shares je moet kopen gebaseerd op risicomanagement.  
+    **Risk-Based**: Hoeveel % van je portfolio wil je riskeren per trade?  
+    **Kelly Criterion**: Wiskundige formule voor optimale positiegrootte (agressiever).
+    """)
     
     # Portfolio value
     total_portfolio_value = sum(
@@ -2841,6 +4096,475 @@ with tab11:
             """)
         else:
             st.error("Kon positiegrootte niet berekenen. Controleer je input.")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 12 – YouTuber Stock Picks (met automatische video analyse)
+# ════════════════════════════════════════════════════════════════════════════
+with tab12:
+    st.header("🎬 YouTuber Stock Picks")
+    st.info("""
+    🎬 **Wat zie je hier?**  
+    **Automatische video analyse!** Plak een YouTube video URL en we detecteren automatisch welke stocks 
+    worden besproken door het transcript te analyseren. Je ziet ook het sentiment (bullish/bearish) per stock.
+    Track de performance van YouTuber picks en zie wie het beste track record heeft!
+    """)
+    
+    # Load data
+    youtubers = user_data.get("youtubers", [])
+    youtuber_picks = user_data.get("youtuber_picks", [])
+    analyzed_videos = user_data.get("analyzed_videos", [])
+    
+    # ════════════════════════════════════════════════════════════════════════════
+    # AUTOMATIC VIDEO ANALYSIS
+    # ════════════════════════════════════════════════════════════════════════════
+    st.subheader("🔍 Automatische Video Analyse")
+    st.caption("Plak een YouTube video URL en we detecteren automatisch de besproken stocks!")
+    
+    analysis_cols = st.columns([2, 1.5, 1])
+    with analysis_cols[0]:
+        video_url = st.text_input(
+            "YouTube Video URL",
+            placeholder="https://www.youtube.com/watch?v=...",
+            key="yt_video_url"
+        )
+    with analysis_cols[1]:
+        video_youtuber = st.text_input(
+            "YouTuber Naam",
+            placeholder="Meet Kevin / Graham Stephan / etc.",
+            key="video_youtuber"
+        )
+    with analysis_cols[2]:
+        st.write("")
+        st.write("")
+        analyze_button = st.button("🔍 Analyseer Video", key="analyze_video", use_container_width=True)
+    
+    # Session state for detected stocks
+    if "detected_stocks" not in st.session_state:
+        st.session_state.detected_stocks = []
+    if "analysis_status" not in st.session_state:
+        st.session_state.analysis_status = ""
+    
+    if analyze_button:
+        if video_url and video_youtuber:
+            video_id = extract_video_id(video_url)
+            if video_id:
+                with st.spinner("📝 Transcript ophalen en analyseren..."):
+                    transcript, error = get_youtube_transcript(video_id)
+                    
+                    if transcript:
+                        # Detect stocks
+                        detected = detect_stocks_in_text(transcript)
+                        st.session_state.detected_stocks = detected
+                        st.session_state.analysis_youtuber = video_youtuber
+                        st.session_state.analysis_video_id = video_id
+                        
+                        if detected:
+                            st.session_state.analysis_status = "success"
+                            # Save analyzed video
+                            analyzed_videos.append({
+                                "video_id": video_id,
+                                "url": video_url,
+                                "youtuber": video_youtuber,
+                                "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                                "stocks_found": len(detected),
+                            })
+                            user_data["analyzed_videos"] = analyzed_videos
+                            save_user_portfolio(st.session_state.current_user, user_data)
+                        else:
+                            st.session_state.analysis_status = "no_stocks"
+                    else:
+                        st.session_state.analysis_status = f"error: {error}"
+                        st.session_state.detected_stocks = []
+            else:
+                st.error("❌ Ongeldige YouTube URL. Plak een volledige YouTube link.")
+        else:
+            st.warning("⚠️ Vul zowel de video URL als de YouTuber naam in.")
+    
+    # Show detection results
+    if st.session_state.analysis_status == "success" and st.session_state.detected_stocks:
+        st.success(f"✅ **{len(st.session_state.detected_stocks)} stocks gedetecteerd** in de video van {st.session_state.get('analysis_youtuber', 'Unknown')}!")
+        
+        st.markdown("### 📊 Gedetecteerde Stocks")
+        st.caption("Sentiment is gebaseerd op gewogen keyword-analyse van de context rond elke stock mention.")
+        
+        # Display detected stocks with option to add
+        for i, stock in enumerate(st.session_state.detected_stocks):
+            det_cols = st.columns([1, 0.8, 1.2, 1.8, 0.6, 0.6])
+            
+            det_cols[0].markdown(f"**{stock['ticker']}**")
+            det_cols[1].markdown(f"${stock['price']:.2f}" if stock['price'] > 0 else "N/A")
+            
+            # Show sentiment with score breakdown
+            bull_score = stock.get('bullish_score', 0)
+            bear_score = stock.get('bearish_score', 0)
+            sentiment_text = stock['sentiment']
+            if bull_score > 0 or bear_score > 0:
+                det_cols[2].markdown(f"{sentiment_text}  \n`📈{bull_score} 📉{bear_score}`")
+            else:
+                det_cols[2].markdown(f"{sentiment_text}")
+            
+            # Show context snippet
+            if stock.get('context'):
+                det_cols[3].caption(f"_{stock['context'][:60]}_")
+            else:
+                det_cols[3].markdown("")
+            
+            # Add to picks button
+            if det_cols[4].button("📊", key=f"add_detected_{i}_{stock['ticker']}", help="Track deze pick"):
+                # Add to youtuber_picks
+                youtuber_picks.append({
+                    "youtuber": st.session_state.get('analysis_youtuber', 'Unknown'),
+                    "ticker": stock['ticker'],
+                    "sentiment": stock['sentiment'],
+                    "target": None,
+                    "date": datetime.now().strftime("%Y-%m-%d"),
+                    "price_at_pick": stock['price'],
+                    "source": "auto_detected",
+                    "video_id": st.session_state.get('analysis_video_id', ''),
+                })
+                user_data["youtuber_picks"] = youtuber_picks
+                save_user_portfolio(st.session_state.current_user, user_data)
+                st.success(f"✅ {stock['ticker']} tracking toegevoegd!")
+                st.rerun()
+            
+            # Add to watchlist button (individual)
+            if det_cols[5].button("👁️", key=f"add_wl_{i}_{stock['ticker']}", help="Toevoegen aan watchlist"):
+                current_watchlist = user_data.get("watchlist_raw", "")
+                current_tickers = [t.strip().upper() for t in current_watchlist.replace(",", " ").split() if t.strip()]
+                
+                if stock['ticker'] not in current_tickers:
+                    current_tickers.append(stock['ticker'])
+                    user_data["watchlist_raw"] = ", ".join(current_tickers)
+                    save_user_portfolio(st.session_state.current_user, user_data)
+                    st.success(f"✅ {stock['ticker']} aan watchlist toegevoegd!")
+                else:
+                    st.info(f"ℹ️ {stock['ticker']} staat al in je watchlist")
+                st.rerun()
+        
+        st.caption("📊 = Track pick | 👁️ = Naar watchlist")
+        
+        # Bulk add button
+        st.divider()
+        
+        # Sentiment override section
+        with st.expander("✏️ Sentiment Aanpassen (optioneel)"):
+            st.caption("Als je weet dat de YouTuber positiever/negatiever is over een stock dan gedetecteerd, pas het hier aan:")
+            
+            override_cols = st.columns([1, 2, 1])
+            with override_cols[0]:
+                override_ticker = st.selectbox(
+                    "Stock",
+                    options=[s['ticker'] for s in st.session_state.detected_stocks],
+                    key="override_ticker"
+                )
+            with override_cols[1]:
+                new_sentiment = st.radio(
+                    "Nieuw Sentiment",
+                    options=["🟢 Bullish", "🟡 Neutral", "🔴 Bearish"],
+                    horizontal=True,
+                    key="new_sentiment"
+                )
+            with override_cols[2]:
+                st.write("")
+                if st.button("✅ Update", key="apply_override"):
+                    for stock in st.session_state.detected_stocks:
+                        if stock['ticker'] == override_ticker:
+                            stock['sentiment'] = new_sentiment
+                    st.success(f"✅ {override_ticker} sentiment geüpdatet naar {new_sentiment}")
+                    st.rerun()
+        
+        if st.button("📥 Voeg ALLE gedetecteerde stocks toe", key="add_all_detected", type="primary"):
+            added_count = 0
+            for stock in st.session_state.detected_stocks:
+                # Check if not already tracked from this video
+                already_exists = any(
+                    p["ticker"] == stock["ticker"] and 
+                    p.get("video_id") == st.session_state.get('analysis_video_id', '')
+                    for p in youtuber_picks
+                )
+                if not already_exists:
+                    youtuber_picks.append({
+                        "youtuber": st.session_state.get('analysis_youtuber', 'Unknown'),
+                        "ticker": stock['ticker'],
+                        "sentiment": stock['sentiment'],
+                        "target": None,
+                        "date": datetime.now().strftime("%Y-%m-%d"),
+                        "price_at_pick": stock['price'],
+                        "source": "auto_detected",
+                        "video_id": st.session_state.get('analysis_video_id', ''),
+                    })
+                    added_count += 1
+            
+            user_data["youtuber_picks"] = youtuber_picks
+            save_user_portfolio(st.session_state.current_user, user_data)
+            st.success(f"✅ {added_count} stocks toegevoegd aan tracking!")
+            st.session_state.detected_stocks = []
+            st.session_state.analysis_status = ""
+            st.rerun()
+        
+        # Add to watchlist button
+        add_wl_cols = st.columns(2)
+        with add_wl_cols[0]:
+            if st.button("👁️ Voeg ALLE toe aan Watchlist", key="add_all_to_watchlist"):
+                # Get current watchlist
+                current_watchlist = user_data.get("watchlist_raw", "")
+                current_tickers = [t.strip().upper() for t in current_watchlist.replace(",", " ").split() if t.strip()]
+                
+                added_to_wl = 0
+                for stock in st.session_state.detected_stocks:
+                    if stock['ticker'] not in current_tickers:
+                        current_tickers.append(stock['ticker'])
+                        added_to_wl += 1
+                
+                # Save updated watchlist
+                user_data["watchlist_raw"] = ", ".join(current_tickers)
+                save_user_portfolio(st.session_state.current_user, user_data)
+                st.success(f"✅ {added_to_wl} stocks toegevoegd aan watchlist!")
+                st.rerun()
+        
+        with add_wl_cols[1]:
+            if st.button("📥👁️ Voeg ALLE toe aan BEIDE (Track + Watchlist)", key="add_all_both", type="secondary"):
+                # Add to YouTuber picks
+                added_picks = 0
+                for stock in st.session_state.detected_stocks:
+                    already_exists = any(
+                        p["ticker"] == stock["ticker"] and 
+                        p.get("video_id") == st.session_state.get('analysis_video_id', '')
+                        for p in youtuber_picks
+                    )
+                    if not already_exists:
+                        youtuber_picks.append({
+                            "youtuber": st.session_state.get('analysis_youtuber', 'Unknown'),
+                            "ticker": stock['ticker'],
+                            "sentiment": stock['sentiment'],
+                            "target": None,
+                            "date": datetime.now().strftime("%Y-%m-%d"),
+                            "price_at_pick": stock['price'],
+                            "source": "auto_detected",
+                            "video_id": st.session_state.get('analysis_video_id', ''),
+                        })
+                        added_picks += 1
+                
+                # Add to watchlist
+                current_watchlist = user_data.get("watchlist_raw", "")
+                current_tickers = [t.strip().upper() for t in current_watchlist.replace(",", " ").split() if t.strip()]
+                
+                added_wl = 0
+                for stock in st.session_state.detected_stocks:
+                    if stock['ticker'] not in current_tickers:
+                        current_tickers.append(stock['ticker'])
+                        added_wl += 1
+                
+                # Save both
+                user_data["youtuber_picks"] = youtuber_picks
+                user_data["watchlist_raw"] = ", ".join(current_tickers)
+                save_user_portfolio(st.session_state.current_user, user_data)
+                
+                st.success(f"✅ {added_picks} stocks naar tracking + {added_wl} naar watchlist!")
+                st.session_state.detected_stocks = []
+                st.session_state.analysis_status = ""
+                st.rerun()
+    
+    elif st.session_state.analysis_status == "no_stocks":
+        st.warning("⚠️ Geen stocks gedetecteerd in deze video. Mogelijk bevat de video geen specifieke stock aanbevelingen.")
+    
+    elif st.session_state.analysis_status.startswith("error:"):
+        st.error(f"❌ {st.session_state.analysis_status.replace('error: ', '')}")
+    
+    st.divider()
+    
+    # ════════════════════════════════════════════════════════════════════════════
+    # MANUAL PICK LOGGING (optional)
+    # ════════════════════════════════════════════════════════════════════════════
+    with st.expander("📝 Handmatig Stock Pick Loggen (optioneel)"):
+        st.caption("Voor als je een pick wilt loggen zonder video analyse.")
+        
+        manual_cols = st.columns([1.5, 1, 1, 1, 1, 1])
+        
+        with manual_cols[0]:
+            manual_youtuber = st.text_input("YouTuber", placeholder="Meet Kevin", key="manual_youtuber")
+        with manual_cols[1]:
+            manual_ticker = st.text_input("Ticker", placeholder="AAPL", key="manual_ticker").upper()
+        with manual_cols[2]:
+            manual_sentiment = st.selectbox(
+                "Sentiment",
+                options=["🟢 Bullish", "🟡 Neutral", "🔴 Bearish"],
+                key="manual_sentiment"
+            )
+        with manual_cols[3]:
+            manual_target = st.number_input("Target ($)", value=0.0, min_value=0.0, step=1.0, key="manual_target")
+        with manual_cols[4]:
+            manual_date = st.date_input("Datum", value=datetime.now(), key="manual_date")
+        with manual_cols[5]:
+            st.write("")
+            st.write("")
+            if st.button("📝 Log Pick", key="log_manual_pick", use_container_width=True):
+                if manual_ticker.strip() and manual_youtuber.strip():
+                    current_price = get_current_price(manual_ticker)
+                    youtuber_picks.append({
+                        "youtuber": manual_youtuber.strip(),
+                        "ticker": manual_ticker.strip(),
+                        "sentiment": manual_sentiment,
+                        "target": manual_target if manual_target > 0 else None,
+                        "date": manual_date.strftime("%Y-%m-%d"),
+                        "price_at_pick": current_price,
+                        "source": "manual",
+                    })
+                    user_data["youtuber_picks"] = youtuber_picks
+                    save_user_portfolio(st.session_state.current_user, user_data)
+                    st.success(f"✅ {manual_ticker} pick van {manual_youtuber} gelogd!")
+                    st.rerun()
+                else:
+                    st.error("Vul zowel YouTuber als Ticker in")
+    
+    st.divider()
+    
+    # ════════════════════════════════════════════════════════════════════════════
+    # ANALYZED VIDEOS HISTORY
+    # ════════════════════════════════════════════════════════════════════════════
+    if analyzed_videos:
+        with st.expander(f"📺 Geanalyseerde Video's ({len(analyzed_videos)})"):
+            for vid in sorted(analyzed_videos, key=lambda x: x["date"], reverse=True)[:10]:
+                vid_cols = st.columns([2, 1.5, 1, 0.5])
+                vid_cols[0].markdown(f"**{vid['youtuber']}**")
+                vid_cols[1].markdown(f"📅 {vid['date']}")
+                vid_cols[2].markdown(f"🔢 {vid['stocks_found']} stocks")
+                vid_cols[3].markdown(f"[🔗](https://youtube.com/watch?v={vid['video_id']})")
+    
+    # ════════════════════════════════════════════════════════════════════════════
+    # PICKS OVERVIEW & PERFORMANCE
+    # ════════════════════════════════════════════════════════════════════════════
+    if youtuber_picks:
+        st.subheader("📊 Alle Picks & Performance")
+        
+        # Calculate performance for each pick
+        picks_with_perf = []
+        for pick in youtuber_picks:
+            ticker = pick["ticker"]
+            price_at_pick = pick.get("price_at_pick", 0)
+            
+            # Get current price
+            df = ticker_data.get(ticker, pd.DataFrame())
+            if not df.empty:
+                current_price = df["Close"].iloc[-1]
+            else:
+                current_price = get_current_price(ticker)
+            
+            # Calculate performance
+            if price_at_pick > 0:
+                performance = ((current_price - price_at_pick) / price_at_pick) * 100
+            else:
+                performance = 0
+            
+            picks_with_perf.append({
+                **pick,
+                "current_price": current_price,
+                "performance": performance,
+            })
+        
+        # Sort by date (newest first)
+        picks_with_perf = sorted(picks_with_perf, key=lambda x: x["date"], reverse=True)
+        
+        # Display picks
+        for idx, pick in enumerate(picks_with_perf):
+            perf = pick["performance"]
+            perf_color = "#3fb950" if perf >= 0 else "#f85149"
+            sentiment_emoji = pick["sentiment"].split()[0]
+            source_badge = "🤖" if pick.get("source") == "auto_detected" else "✍️"
+            
+            col1, col2, col3, col4, col5, col6 = st.columns([1.5, 1.2, 1.2, 1, 1.2, 0.5])
+            col1.markdown(f"**{pick['youtuber']}** {source_badge}")
+            col2.markdown(f"**{pick['ticker']}** {sentiment_emoji}")
+            col3.markdown(f"${pick.get('price_at_pick', 0):.2f} → ${pick['current_price']:.2f}")
+            col4.markdown(f"<span style='color:{perf_color}; font-weight:700'>{perf:+.1f}%</span>", unsafe_allow_html=True)
+            col5.markdown(f"📅 {pick['date']}")
+            if col6.button("🗑️", key=f"del_pick_{idx}_{pick['date']}_{pick['ticker']}"):
+                youtuber_picks = [p for i, p in enumerate(youtuber_picks) if i != idx]
+                user_data["youtuber_picks"] = youtuber_picks
+                save_user_portfolio(st.session_state.current_user, user_data)
+                st.rerun()
+        
+        st.caption("🤖 = Auto-detected | ✍️ = Handmatig toegevoegd")
+        
+        st.divider()
+        
+        # ════════════════════════════════════════════════════════════════════════════
+        # LEADERBOARD
+        # ════════════════════════════════════════════════════════════════════════════
+        st.subheader("🏆 YouTuber Leaderboard")
+        
+        # Calculate stats per YouTuber
+        yt_stats = {}
+        for pick in picks_with_perf:
+            yt = pick["youtuber"]
+            if yt not in yt_stats:
+                yt_stats[yt] = {"picks": 0, "total_perf": 0, "wins": 0}
+            yt_stats[yt]["picks"] += 1
+            yt_stats[yt]["total_perf"] += pick["performance"]
+            if pick["performance"] > 0:
+                yt_stats[yt]["wins"] += 1
+        
+        # Sort by average performance
+        leaderboard = []
+        for yt, stats in yt_stats.items():
+            avg_perf = stats["total_perf"] / stats["picks"] if stats["picks"] > 0 else 0
+            win_rate = (stats["wins"] / stats["picks"] * 100) if stats["picks"] > 0 else 0
+            leaderboard.append({
+                "youtuber": yt,
+                "picks": stats["picks"],
+                "avg_perf": avg_perf,
+                "win_rate": win_rate,
+            })
+        
+        leaderboard = sorted(leaderboard, key=lambda x: x["avg_perf"], reverse=True)
+        
+        for i, yt in enumerate(leaderboard, 1):
+            medal = "🥇" if i == 1 else ("🥈" if i == 2 else ("🥉" if i == 3 else f"{i}."))
+            perf_color = "#3fb950" if yt["avg_perf"] >= 0 else "#f85149"
+            
+            lb_cols = st.columns([0.5, 2, 1, 1.5, 1.5])
+            lb_cols[0].markdown(f"**{medal}**")
+            lb_cols[1].markdown(f"**{yt['youtuber']}**")
+            lb_cols[2].markdown(f"{yt['picks']} picks")
+            lb_cols[3].markdown(f"<span style='color:{perf_color}; font-weight:700'>Avg: {yt['avg_perf']:+.1f}%</span>", unsafe_allow_html=True)
+            lb_cols[4].markdown(f"Win rate: {yt['win_rate']:.0f}%")
+        
+        st.divider()
+        
+        # ════════════════════════════════════════════════════════════════════════════
+        # OVERLAP DETECTOR
+        # ════════════════════════════════════════════════════════════════════════════
+        st.subheader("🔥 Stock Overlap (Meerdere YouTubers)")
+        st.caption("Stocks die door meerdere YouTubers worden genoemd - mogelijke sterke signalen!")
+        
+        # Count how many YouTubers mention each stock
+        stock_mentions = {}
+        for pick in youtuber_picks:
+            ticker = pick["ticker"]
+            yt = pick["youtuber"]
+            if ticker not in stock_mentions:
+                stock_mentions[ticker] = set()
+            stock_mentions[ticker].add(yt)
+        
+        # Filter stocks mentioned by multiple YouTubers
+        overlaps = [(ticker, list(yters)) for ticker, yters in stock_mentions.items() if len(yters) >= 2]
+        overlaps = sorted(overlaps, key=lambda x: len(x[1]), reverse=True)
+        
+        if overlaps:
+            for ticker, yters in overlaps:
+                df = ticker_data.get(ticker, pd.DataFrame())
+                current_price = df["Close"].iloc[-1] if not df.empty else get_current_price(ticker)
+                
+                st.markdown(f"""
+                🎯 **{ticker}** (${current_price:.2f}) - Genoemd door **{len(yters)}** YouTubers:  
+                {', '.join(yters)}
+                """)
+        else:
+            st.info("Nog geen stocks die door meerdere YouTubers genoemd worden. Analyseer meer video's!")
+    
+    else:
+        st.info("🎬 Nog geen picks gelogd. Analyseer een YouTube video hierboven om te beginnen!")
 
 
 # ════════════════════════════════════════════════════════════════════════════
