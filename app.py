@@ -13,6 +13,9 @@ import io
 import base64
 import csv
 import re
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
 
@@ -48,7 +51,7 @@ def load_user_portfolio(username: str) -> dict:
             if "analyzed_videos" not in data:
                 data["analyzed_videos"] = []
             return data
-    return {"portfolio_raw": "", "watchlist_raw": "", "price_alerts": [], "portfolio_history": [], "watchlist_categories": {}, "youtubers": [], "youtuber_picks": [], "analyzed_videos": []}
+    return {"portfolio_raw": "", "watchlist_raw": "", "price_alerts": [], "portfolio_history": [], "watchlist_categories": {}, "youtubers": [], "youtuber_picks": [], "analyzed_videos": [], "email_config": {}}
 
 def save_user_portfolio(username: str, data: dict):
     """Save user's portfolio to JSON file."""
@@ -59,6 +62,183 @@ def save_user_portfolio(username: str, data: dict):
 def get_all_users() -> list:
     """Get list of all registered users."""
     return [f.stem for f in DATA_DIR.glob("*.json")]
+
+
+# ── Email Functions ───────────────────────────────────────────────────────────
+def send_email_alert(to_email: str, subject: str, body: str, email_config: dict) -> tuple:
+    """
+    Send email alert using SMTP.
+    Returns (success: bool, message: str)
+    
+    Supports:
+    - Gmail (requires App Password)
+    - Outlook/Hotmail
+    - Custom SMTP servers
+    """
+    try:
+        smtp_server = email_config.get("smtp_server", "smtp.gmail.com")
+        smtp_port = email_config.get("smtp_port", 587)
+        sender_email = email_config.get("sender_email", "")
+        sender_password = email_config.get("sender_password", "")
+        
+        if not sender_email or not sender_password:
+            return False, "Email configuratie incompleet. Stel sender email en wachtwoord in."
+        
+        # Create message
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = sender_email
+        msg["To"] = to_email
+        
+        # HTML body
+        html_body = f"""
+        <html>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; background: #0d1117; color: #e6edf3; padding: 20px; }}
+                .container {{ background: #161b22; border-radius: 12px; padding: 20px; max-width: 600px; margin: 0 auto; }}
+                .header {{ color: #58a6ff; font-size: 24px; font-weight: bold; margin-bottom: 20px; }}
+                .content {{ line-height: 1.6; }}
+                .footer {{ margin-top: 20px; padding-top: 15px; border-top: 1px solid #30363d; font-size: 12px; color: #8b949e; }}
+                .alert-box {{ background: #0d2318; border: 2px solid #3fb950; border-radius: 8px; padding: 15px; margin: 10px 0; }}
+                .warning-box {{ background: #3d1515; border: 2px solid #f85149; border-radius: 8px; padding: 15px; margin: 10px 0; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">📈 Stock Dashboard Alert</div>
+                <div class="content">
+                    {body}
+                </div>
+                <div class="footer">
+                    Verzonden door Stock Dashboard · {datetime.now().strftime('%d %b %Y, %H:%M')}
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        # Attach both plain text and HTML
+        plain_text = body.replace("<br>", "\n").replace("<b>", "").replace("</b>", "")
+        part1 = MIMEText(plain_text, "plain")
+        part2 = MIMEText(html_body, "html")
+        msg.attach(part1)
+        msg.attach(part2)
+        
+        # Send email
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.starttls()
+            server.login(sender_email, sender_password)
+            server.sendmail(sender_email, to_email, msg.as_string())
+        
+        return True, f"✅ Email verzonden naar {to_email}"
+    
+    except smtplib.SMTPAuthenticationError:
+        return False, "❌ Authenticatie mislukt. Controleer email en wachtwoord (gebruik App Password voor Gmail)."
+    except smtplib.SMTPException as e:
+        return False, f"❌ SMTP fout: {str(e)}"
+    except Exception as e:
+        return False, f"❌ Fout bij verzenden: {str(e)}"
+
+
+def build_alert_email_body(triggered_alerts: list, ticker_data: dict) -> str:
+    """Build HTML email body for triggered alerts."""
+    body = "<h2>🚨 De volgende alerts zijn getriggerd:</h2>"
+    
+    for alert in triggered_alerts:
+        ticker = alert.get("ticker", "???")
+        current_price = 0
+        df = ticker_data.get(ticker, pd.DataFrame())
+        if not df.empty and "Close" in df.columns:
+            current_price = float(df["Close"].iloc[-1])
+        
+        alert_type_str = "📈 Boven target" if alert.get("type") == "above" else "📉 Onder target"
+        
+        body += f"""
+        <div class="alert-box">
+            <b style="font-size:18px; color:#3fb950">{ticker}</b><br>
+            <b>Type:</b> {alert_type_str}<br>
+            <b>Target:</b> ${alert.get('target_price', 0):.2f}<br>
+            <b>Huidige prijs:</b> ${current_price:.2f}<br>
+        </div>
+        """
+    
+    body += "<br><p>Log in op je Stock Dashboard voor meer details.</p>"
+    return body
+
+
+def build_portfolio_summary_email(portfolio_positions: list, ticker_data: dict) -> str:
+    """Build HTML email body for daily portfolio summary."""
+    total_value = 0
+    total_cost = 0
+    positions_html = ""
+    
+    for pos in portfolio_positions:
+        ticker = pos["ticker"]
+        qty = pos["qty"]
+        gak = pos["gak"]
+        
+        df = ticker_data.get(ticker, pd.DataFrame())
+        current_price = float(df["Close"].iloc[-1]) if not df.empty and "Close" in df.columns else 0
+        
+        value = current_price * qty
+        cost = gak * qty
+        pnl = value - cost
+        pnl_pct = (pnl / cost * 100) if cost > 0 else 0
+        
+        total_value += value
+        total_cost += cost
+        
+        color = "#3fb950" if pnl >= 0 else "#f85149"
+        
+        positions_html += f"""
+        <tr>
+            <td style="padding:8px; border-bottom:1px solid #30363d"><b>{ticker}</b></td>
+            <td style="padding:8px; border-bottom:1px solid #30363d">${current_price:.2f}</td>
+            <td style="padding:8px; border-bottom:1px solid #30363d">{qty:.2f}</td>
+            <td style="padding:8px; border-bottom:1px solid #30363d">${value:.2f}</td>
+            <td style="padding:8px; border-bottom:1px solid #30363d; color:{color}">{pnl_pct:+.2f}%</td>
+        </tr>
+        """
+    
+    total_pnl = total_value - total_cost
+    total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0
+    total_color = "#3fb950" if total_pnl >= 0 else "#f85149"
+    
+    body = f"""
+    <h2>📊 Portfolio Overzicht</h2>
+    <p><b>Datum:</b> {datetime.now().strftime('%d %B %Y')}</p>
+    
+    <div style="display:flex; gap:20px; margin:15px 0">
+        <div style="background:#161b22; padding:15px; border-radius:8px; flex:1">
+            <div style="color:#8b949e; font-size:12px">Totaal Geïnvesteerd</div>
+            <div style="font-size:20px; font-weight:bold">${total_cost:.2f}</div>
+        </div>
+        <div style="background:#161b22; padding:15px; border-radius:8px; flex:1">
+            <div style="color:#8b949e; font-size:12px">Huidige Waarde</div>
+            <div style="font-size:20px; font-weight:bold">${total_value:.2f}</div>
+        </div>
+        <div style="background:#161b22; padding:15px; border-radius:8px; flex:1">
+            <div style="color:#8b949e; font-size:12px">Totaal W/V</div>
+            <div style="font-size:20px; font-weight:bold; color:{total_color}">${total_pnl:+.2f} ({total_pnl_pct:+.2f}%)</div>
+        </div>
+    </div>
+    
+    <h3>📋 Posities</h3>
+    <table style="width:100%; border-collapse:collapse">
+        <tr style="background:#21262d">
+            <th style="padding:10px; text-align:left">Ticker</th>
+            <th style="padding:10px; text-align:left">Prijs</th>
+            <th style="padding:10px; text-align:left">Aantal</th>
+            <th style="padding:10px; text-align:left">Waarde</th>
+            <th style="padding:10px; text-align:left">W/V %</th>
+        </tr>
+        {positions_html}
+    </table>
+    """
+    
+    return body
+
 
 # ── Custom CSS ────────────────────────────────────────────────────────────────
 
@@ -650,7 +830,7 @@ st.markdown(theme_css, unsafe_allow_html=True)
 # ── Helpers ───────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=300)
 def fetch_data(ticker: str, period: str = "1y") -> pd.DataFrame:
-    """Download OHLCV data and compute RSI + SMA200."""
+    """Download OHLCV data and compute full technical indicators."""
     try:
         df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
         if df.empty:
@@ -662,11 +842,28 @@ def fetch_data(ticker: str, period: str = "1y") -> pd.DataFrame:
         if df.empty:
             return pd.DataFrame()
         close = df["Close"].squeeze()
+        # Moving Averages
+        df["SMA20"] = ta_lib.trend.sma_indicator(close, window=20)
+        df["SMA50"] = ta_lib.trend.sma_indicator(close, window=50)
         df["SMA200"] = ta_lib.trend.sma_indicator(close, window=200)
+        df["EMA12"] = ta_lib.trend.ema_indicator(close, window=12)
+        df["EMA26"] = ta_lib.trend.ema_indicator(close, window=26)
+        # RSI
         df["RSI"] = ta_lib.momentum.rsi(close, window=14)
+        # MACD
+        df["MACD"] = ta_lib.trend.macd(close)
+        df["MACD_Signal"] = ta_lib.trend.macd_signal(close)
+        df["MACD_Hist"] = ta_lib.trend.macd_diff(close)
+        # Bollinger Bands
+        df["BB_Upper"] = ta_lib.volatility.bollinger_hband(close, window=20)
+        df["BB_Lower"] = ta_lib.volatility.bollinger_lband(close, window=20)
+        df["BB_Mid"] = ta_lib.volatility.bollinger_mavg(close, window=20)
+        # ATR (Average True Range) for volatility
+        df["ATR"] = ta_lib.volatility.average_true_range(df["High"].squeeze(), df["Low"].squeeze(), close, window=14)
+        # Daily change
+        df["Change_Pct"] = close.pct_change() * 100
         return df
     except Exception as e:
-        st.warning(f"⚠️ Kan geen data ophalen voor {ticker}: {str(e)}")
         return pd.DataFrame()
 
 
@@ -1483,7 +1680,7 @@ def calculate_position_size(account_value: float, risk_per_trade: float, entry_p
     }
 
 
-def build_enhanced_chart(df: pd.DataFrame, ticker: str, show_bb: bool = True, show_macd: bool = True) -> go.Figure:
+def build_enhanced_chart(df: pd.DataFrame, ticker: str, show_bb: bool = True, show_macd: bool = True, theme: str = "dark") -> go.Figure:
     """Enhanced candlestick chart with Bollinger Bands and MACD."""
     if df.empty:
         return go.Figure()
@@ -1586,10 +1783,12 @@ def build_enhanced_chart(df: pd.DataFrame, ticker: str, show_bb: bool = True, sh
             row=3, col=1,
         )
     
+    _chart_template = "plotly_dark" if st.session_state.get('theme', 'dark') == 'dark' else "plotly_white"
+    _chart_bg = "#0e1117" if st.session_state.get('theme', 'dark') == 'dark' else "#ffffff"
     fig.update_layout(
-        template="plotly_dark",
-        paper_bgcolor="#0e1117",
-        plot_bgcolor="#0e1117",
+        template=_chart_template,
+        paper_bgcolor=_chart_bg,
+        plot_bgcolor=_chart_bg,
         height=700 if show_macd else 550,
         margin=dict(l=10, r=10, t=40, b=10),
         xaxis_rangeslider_visible=False,
@@ -2212,10 +2411,12 @@ def build_candlestick(df: pd.DataFrame, ticker: str) -> go.Figure:
                 row=2, col=1,
             )
 
+    _tpl = "plotly_dark" if st.session_state.get('theme', 'dark') == 'dark' else "plotly_white"
+    _bg = "#0e1117" if st.session_state.get('theme', 'dark') == 'dark' else "#ffffff"
     fig.update_layout(
-        template="plotly_dark",
-        paper_bgcolor="#0e1117",
-        plot_bgcolor="#0e1117",
+        template=_tpl,
+        paper_bgcolor=_bg,
+        plot_bgcolor=_bg,
         height=620,
         margin=dict(l=10, r=10, t=40, b=10),
         xaxis_rangeslider_visible=False,
@@ -2420,6 +2621,82 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
+    # --- Email Configuration ---
+    st.divider()
+    st.subheader("📧 Email Alerts")
+    
+    email_config = user_data.get("email_config", {})
+    
+    with st.expander("⚙️ Email Configuratie", expanded=False):
+        st.caption("Configureer SMTP instellingen voor email alerts")
+        
+        # Email provider selection
+        current_smtp = email_config.get("smtp_server", "")
+        default_idx = 1 if "office365" in current_smtp or "outlook" in current_smtp.lower() else 0
+        email_provider = st.selectbox(
+            "Email Provider",
+            options=["Gmail", "Outlook/Hotmail", "Yahoo", "Custom SMTP"],
+            index=default_idx,
+            key="email_provider"
+        )
+        
+        # Pre-fill SMTP settings based on provider
+        if email_provider == "Gmail":
+            default_smtp = "smtp.gmail.com"
+            default_port = 587
+            st.info("💡 Voor Gmail: maak een [App Password](https://myaccount.google.com/apppasswords) aan.")
+        elif email_provider == "Outlook/Hotmail":
+            default_smtp = "smtp.office365.com"
+            default_port = 587
+        elif email_provider == "Yahoo":
+            default_smtp = "smtp.mail.yahoo.com"
+            default_port = 587
+        else:
+            default_smtp = email_config.get("smtp_server", "smtp.gmail.com")
+            default_port = email_config.get("smtp_port", 587)
+        
+        cfg_smtp = st.text_input("SMTP Server", value=email_config.get("smtp_server", default_smtp), key="cfg_smtp")
+        cfg_port = st.number_input("SMTP Port", value=email_config.get("smtp_port", default_port), min_value=1, max_value=65535, key="cfg_port")
+        cfg_sender = st.text_input("Jouw Email", value=email_config.get("sender_email", ""), placeholder="jouw@email.com", key="cfg_sender")
+        cfg_password = st.text_input("App Password", value=email_config.get("sender_password", ""), type="password", key="cfg_password")
+        cfg_recipient = st.text_input("Ontvanger Email", value=email_config.get("recipient_email", ""), placeholder="ontvanger@email.com", key="cfg_recipient")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("💾 Opslaan", use_container_width=True, key="save_email_cfg"):
+                email_config = {
+                    "smtp_server": cfg_smtp,
+                    "smtp_port": int(cfg_port),
+                    "sender_email": cfg_sender,
+                    "sender_password": cfg_password,
+                    "recipient_email": cfg_recipient,
+                }
+                user_data["email_config"] = email_config
+                save_user_portfolio(st.session_state.current_user, user_data)
+                st.success("✅ Email configuratie opgeslagen!")
+        
+        with col2:
+            if st.button("📧 Test Email", use_container_width=True, key="test_email"):
+                if cfg_sender and cfg_password and cfg_recipient:
+                    test_config = {
+                        "smtp_server": cfg_smtp,
+                        "smtp_port": int(cfg_port),
+                        "sender_email": cfg_sender,
+                        "sender_password": cfg_password,
+                    }
+                    success, message = send_email_alert(
+                        cfg_recipient,
+                        "🧪 Test Email - Stock Dashboard",
+                        "<h2>✅ Test Succesvol!</h2><p>Je email configuratie werkt correct. Je ontvangt nu alerts op dit adres.</p>",
+                        test_config
+                    )
+                    if success:
+                        st.success(message)
+                    else:
+                        st.error(message)
+                else:
+                    st.error("⚠️ Vul alle email velden in")
+
 
 # ── Parse inputs ──────────────────────────────────────────────────────────────
 portfolio_positions = []
@@ -2454,9 +2731,9 @@ popular_tickers_list = [
     "JPM", "BAC", "GS", "WFC", "V", "MA", "AXP", "BLK", "BX",
     "JNJ", "UNH", "PFE", "MRK", "ABBV", "TMO", "LLY", "AZN",
     "WMT", "MCD", "SBUX", "NKE", "HD", "COST", "CVX", "XOM",
-    "SOFI", "PYPL", "SQ", "COIN", "CRWD", "ZS", "OKTA", "DDOG", "CRM", "ADBE",
+    "SOFI", "PYPL", "COIN", "CRWD", "ZS", "OKTA", "DDOG", "CRM", "ADBE",
     "VTI", "VOO", "QQQ", "IVV", "SPLG", "SCHX",
-    "UBER", "LYFT", "DASH", "ZM", "ROKU", "SNAP", "TWILIO", "RBLX", "U", "PLTR"
+    "UBER", "LYFT", "DASH", "ZM", "ROKU", "SNAP", "RBLX", "PLTR", "ARM", "SMCI"
 ]
 
 all_tickers = list({p["ticker"] for p in portfolio_positions} | set(watchlist_tickers))
@@ -2465,12 +2742,6 @@ all_tickers = list({p["ticker"] for p in portfolio_positions} | set(watchlist_ti
 # ── Fetch all data once ───────────────────────────────────────────────────────
 with st.spinner("📡 Data ophalen…"):
     ticker_data: dict[str, pd.DataFrame] = {t: fetch_data(t) for t in all_tickers}
-    
-    # Also fetch popular stocks for recommendations (in background, don't block)
-    st.write("*Loading recommendation data...*")
-    for t in popular_tickers_list:
-        if t not in ticker_data:
-            ticker_data[t] = fetch_data(t)
 
 
 # ── Helper: latest indicators ─────────────────────────────────────────────────
@@ -2488,20 +2759,81 @@ def latest(ticker: str, col: str) -> float:
     return float(series.iloc[-1])
 
 
+# ── Market Dashboard Header ───────────────────────────────────────────────────
+@st.cache_data(ttl=120)  # Cache 2 minutes
+def get_market_indices() -> dict:
+    """Fetch major market indices for dashboard header."""
+    indices = {}
+    index_map = {
+        "S&P 500": "^GSPC",
+        "NASDAQ": "^IXIC",
+        "DOW": "^DJI",
+        "VIX": "^VIX",
+        "EUR/USD": "EURUSD=X",
+        "BTC": "BTC-USD",
+    }
+    for name, symbol in index_map.items():
+        try:
+            data = yf.download(symbol, period="2d", progress=False, auto_adjust=True)
+            if isinstance(data.columns, pd.MultiIndex):
+                data.columns = data.columns.get_level_values(0)
+            if not data.empty and len(data) >= 2:
+                current = float(data["Close"].iloc[-1])
+                prev = float(data["Close"].iloc[-2])
+                change = current - prev
+                change_pct = (change / prev * 100) if prev > 0 else 0
+                indices[name] = {"price": current, "change": change, "change_pct": change_pct}
+            elif not data.empty:
+                current = float(data["Close"].iloc[-1])
+                indices[name] = {"price": current, "change": 0, "change_pct": 0}
+        except Exception:
+            pass
+    return indices
+
+market_indices = get_market_indices()
+
+if market_indices:
+    idx_html = '<div style="display:flex; flex-wrap:wrap; gap:8px; margin-bottom:16px; justify-content:center">'
+    for name, data in market_indices.items():
+        color = "#3fb950" if data["change_pct"] >= 0 else "#f85149"
+        arrow = "▲" if data["change_pct"] >= 0 else "▼"
+        
+        if name == "BTC":
+            price_str = f"${data['price']:,.0f}"
+        elif name == "EUR/USD":
+            price_str = f"{data['price']:.4f}"
+        elif name == "VIX":
+            price_str = f"{data['price']:.2f}"
+        else:
+            price_str = f"{data['price']:,.0f}"
+        
+        idx_html += f'''
+        <div style="flex:1 1 120px; min-width:100px; max-width:180px; text-align:center; padding:8px 12px; background:{'#141a24' if st.session_state.theme == 'dark' else '#f0f4f8'}; border-radius:10px; border:1px solid {'#1e3a5f' if st.session_state.theme == 'dark' else '#c0d4e8'}">
+            <div style="font-size:0.7rem; color:{'#7a8599' if st.session_state.theme == 'dark' else '#666'}; font-weight:600">{name}</div>
+            <div style="font-size:0.95rem; font-weight:800; color:{'#e6edf3' if st.session_state.theme == 'dark' else '#000'}">{price_str}</div>
+            <div style="font-size:0.75rem; font-weight:700; color:{color}">{arrow} {data['change_pct']:+.2f}%</div>
+        </div>
+        '''
+    idx_html += '</div>'
+    st.markdown(idx_html, unsafe_allow_html=True)
+
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12 = st.tabs([
-    "📁 Portfolio Overzicht", 
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13, tab14, tab15 = st.tabs([
+    "📁 Portfolio", 
     "👁️ Watchlist", 
     "📊 Analytics", 
     "⚙️ Advanced", 
-    "🎯 Aanbevelingen",
-    "⚠️ Alerts & Taxes",
-    "💡 Rebalance & Risk",
-    "💰 Income & Compare",
-    "🔔 Price Alerts",
-    "📈 History & Export",
-    "🧮 Position Calculator",
-    "🎬 YouTuber Picks"
+    "🎯 Tips",
+    "⚠️ Alerts",
+    "💡 Rebalance",
+    "💰 Income",
+    "🔔 Prices",
+    "📈 History",
+    "🧮 Calculator",
+    "🎬 YouTube",
+    "📅 Earnings",
+    "📰 News",
+    "🔍 Screener"
 ])
 
 
@@ -2510,11 +2842,6 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12 = st.t
 # ════════════════════════════════════════════════════════════════════════════
 with tab1:
     st.header("Portfolio Overzicht")
-    st.info("""
-    📁 **Wat zie je hier?**  
-    Een compleet overzicht van al je stocks met actuele prijzen, winst/verlies per positie, 
-    Fair Value berekening en BUY/HOLD/SELL signalen. Inclusief sector verdeling en visualisaties.
-    """)
 
     if not portfolio_positions:
         st.info("Voeg posities toe in de zijbalk (TICKER, AANTAL, GAK).")
@@ -2525,6 +2852,7 @@ with tab1:
             price = latest(t, "Close")
             rsi   = latest(t, "RSI")
             sma   = latest(t, "SMA200")
+            sma50 = latest(t, "SMA50")
             qty   = pos["qty"]
             gak   = pos["gak"]
             wl    = price * qty if price else 0.0
@@ -2535,9 +2863,13 @@ with tab1:
             fair_val = calculate_fair_value(df, price, t)
             status = classify_status(price, sma, rsi, df, fair_val["fair_value"])
             
+            # Daily change
+            daily_change = latest(t, "Change_Pct")
+            
             # Get additional info
             info = fetch_ticker_info(t)
             sector = info.get("sector", "N/A")
+            div_yield = info.get("dividend_yield", 0) or 0
             
             rows.append({
                 "Ticker": t,
@@ -2550,6 +2882,10 @@ with tab1:
                 "W/V ($)": pnl,
                 "W/V (%)": pnl_p,
                 "RSI": rsi,
+                "SMA50": sma50,
+                "SMA200": sma,
+                "Daily_Change": daily_change,
+                "Div_Yield": div_yield,
                 "_status": status,
                 "_fair_val_str": fair_val["valuation"],
                 "_reliability": fair_val.get("reliability", "✅ Good"),
@@ -2565,11 +2901,10 @@ with tab1:
         rows_sorted = sorted(rows, key=lambda x: x["W/V (%)"], reverse=True)
 
         # ── Summary Cards ──
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3, col4, col5 = st.columns(5)
         col1.metric(
-            "💼 Totaal Geïnvesteerd",
+            "💼 Geïnvesteerd",
             f"$ {total_cost:,.2f}",
-            label_visibility="visible"
         )
         
         pnl_delta = f"{total_pnl:+,.0f}" if total_pnl != 0 else "0"
@@ -2577,7 +2912,6 @@ with tab1:
             "💰 Huidige Waarde",
             f"$ {total_value:,.2f}",
             delta=pnl_delta,
-            label_visibility="visible"
         )
         
         pnl_color = "normal" if total_pnl >= 0 else "inverse"
@@ -2586,23 +2920,28 @@ with tab1:
             f"$ {total_pnl:+,.2f}",
             delta=f"{total_pnl_p:+.2f}%",
             delta_color=pnl_color,
-            label_visibility="visible"
         )
         
-        # Risk metric
-        volatilities = []
-        for row in rows:
-            df = ticker_data.get(row["Ticker"], pd.DataFrame())
-            if not df.empty and len(df) >= 20:
-                returns = df["Close"].pct_change()
-                vol = returns.std() * 100
-                volatilities.append(vol)
-        
-        avg_vol = sum(volatilities) / len(volatilities) if volatilities else 0
+        # Day change
+        day_change_value = sum(
+            float(r["Waarde ($)"]) * float(r["Daily_Change"]) / 100
+            for r in rows if not pd.isna(r["Daily_Change"])
+        )
+        day_change_pct = (day_change_value / total_value * 100) if total_value > 0 else 0
         col4.metric(
-            "📊 Portfolio Volatility",
-            f"{avg_vol:.2f}%",
-            label_visibility="visible"
+            "📅 Vandaag",
+            f"$ {day_change_value:+,.2f}",
+            delta=f"{day_change_pct:+.2f}%",
+            delta_color="normal" if day_change_value >= 0 else "inverse",
+        )
+        
+        # Best performer today
+        best_today = max(rows, key=lambda x: x["Daily_Change"] if not pd.isna(x["Daily_Change"]) else -999)
+        worst_today = min(rows, key=lambda x: x["Daily_Change"] if not pd.isna(x["Daily_Change"]) else 999)
+        col5.metric(
+            f"🏆 Best: {best_today['Ticker']}",
+            f"{best_today['Daily_Change']:+.2f}%" if not pd.isna(best_today['Daily_Change']) else "N/A",
+            delta=f"Worst: {worst_today['Ticker']} {worst_today['Daily_Change']:+.1f}%" if not pd.isna(worst_today['Daily_Change']) else None,
         )
         
         st.divider()
@@ -2630,82 +2969,114 @@ with tab1:
         st.divider()
         
         # ── Detailed Holdings Table ──
-        st.subheader("📋 Gedetailleerde Holdings (gesorteerd op performance)")
-        
-        # Build colored table
-        header_cols = st.columns([0.7, 1, 1, 0.8, 0.8, 1, 1, 1, 0.7, 0.7, 1.2, 1.2])
-        headers = ["🎯", "Ticker", "Prijs", "Fair V.", "Aantal", "Waarde", "Kostprijs", "W/V ($)", "W/V %", "RSI", "Status", "Waardering"]
-        
-        for col, h in zip(header_cols, headers):
-            col.markdown(f"**{h}**", help=None)
-        
-        st.markdown('<hr style="margin:2px 0 4px 0; border-color:#2e3140"/>', unsafe_allow_html=True)
+        st.subheader("📋 Holdings")
         
         for idx, r in enumerate(rows_sorted, 1):
             # Color coding
             pnl = float(r["W/V ($)"])
             pnl_p = float(r["W/V (%)"])
             pnl_color = "#3fb950" if pnl >= 0 else "#f85149"
+            daily = float(r["Daily_Change"]) if not pd.isna(r["Daily_Change"]) else 0
+            daily_color = "#3fb950" if daily >= 0 else "#f85149"
             
-            rsi = float(r["RSI"]) if not pd.isna(r["RSI"]) else float("nan")
+            rsi = float(r["RSI"]) if not pd.isna(r["RSI"]) else 50
             rsi_color = "#3fb950" if rsi < 35 else ("#f85149" if rsi > 65 else "#e3b341")
-            rsi_str = f"{rsi:.1f}" if not pd.isna(rsi) else "N/A"
             
-            row_cols = st.columns([0.7, 1, 1, 0.8, 0.8, 1, 1, 1, 0.7, 0.7, 1.2, 1.2])
-            
-            # Ranking
-            if pnl_p >= 20:
-                rank = "🥇"
-            elif pnl_p >= 5:
-                rank = "🥈"
-            elif pnl_p >= 0:
-                rank = "🥉"
+            # Determine card border
+            if r["_status"] == "BUY":
+                border = "#3fb950"
+            elif r["_status"] == "SELL":
+                border = "#f85149"
             else:
-                rank = "📉"
-            row_cols[0].markdown(rank, help=None)
+                border = "#2e3140"
             
-            # Ticker
-            row_cols[1].markdown(f"**{r['Ticker']}**")
+            bg = "#141a24" if st.session_state.theme == "dark" else "#f8fafc"
+            text_color = "#e6edf3" if st.session_state.theme == "dark" else "#000"
+            sub_color = "#8b949e" if st.session_state.theme == "dark" else "#666"
+            card_bg = "#0f1319" if st.session_state.theme == "dark" else "#f0f4f8"
             
-            # Price
-            row_cols[2].markdown(f"${float(r['Prijs']):.2f}")
-            
-            # Fair Value
-            fv = float(r['Fair Value'])
-            row_cols[3].markdown(f"${fv:.2f}")
-            
-            # Quantity
-            row_cols[4].markdown(f"{float(r['Aantal']):.2f}")
-            
-            # Waarde
-            row_cols[5].markdown(f"${float(r['Waarde ($)']):.2f}")
-            
-            # Kostprijs
-            row_cols[6].markdown(f"${float(r['Kostprijs']):.2f}")
-            
-            # W/V ($)
-            row_cols[7].markdown(
-                f'<span style="color:{pnl_color}; font-weight:600">${pnl:+,.2f}</span>',
-                unsafe_allow_html=True
-            )
-            
-            # W/V %
-            row_cols[8].markdown(
-                f'<span style="color:{pnl_color}; font-weight:700">{pnl_p:+.1f}%</span>',
-                unsafe_allow_html=True
-            )
-            
-            # RSI
-            row_cols[9].markdown(
-                f'<span style="color:{rsi_color}; font-weight:600">{rsi_str}</span>',
-                unsafe_allow_html=True
-            )
-            
-            # Status
-            row_cols[10].markdown(status_badge(r["_status"]), unsafe_allow_html=True)
-            
-            # Waardering
-            row_cols[11].markdown(f"<small>{r['_fair_val_str']}</small>", unsafe_allow_html=True)
+            st.markdown(f"""
+            <div style="background:{bg}; border:2px solid {border}; border-radius:14px; padding:16px; margin-bottom:10px;">
+                <div style="display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:10px; margin-bottom:12px">
+                    <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap">
+                        <span style="font-size:1.4rem; font-weight:800; color:{text_color}">{r['Ticker']}</span>
+                        <span style="font-size:0.75rem; color:{sub_color}">{r['Sector'][:20]}</span>
+                        {status_badge(r["_status"])}
+                    </div>
+                    <div style="text-align:right">
+                        <div style="font-size:1.2rem; font-weight:700; color:{text_color}">${float(r['Prijs']):.2f}</div>
+                        <div style="font-size:0.85rem; font-weight:700; color:{daily_color}">{daily:+.2f}% today</div>
+                    </div>
+                </div>
+                <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(90px, 1fr)); gap:8px;">
+                    <div style="text-align:center; padding:8px; background:{card_bg}; border-radius:8px">
+                        <div style="font-size:0.65rem; color:{sub_color}">Waarde</div>
+                        <div style="font-size:0.9rem; font-weight:700; color:{text_color}">${float(r['Waarde ($)']):,.2f}</div>
+                    </div>
+                    <div style="text-align:center; padding:8px; background:{card_bg}; border-radius:8px">
+                        <div style="font-size:0.65rem; color:{sub_color}">W/V</div>
+                        <div style="font-size:0.9rem; font-weight:700; color:{pnl_color}">${pnl:+,.2f}</div>
+                    </div>
+                    <div style="text-align:center; padding:8px; background:{card_bg}; border-radius:8px">
+                        <div style="font-size:0.65rem; color:{sub_color}">Return</div>
+                        <div style="font-size:0.9rem; font-weight:700; color:{pnl_color}">{pnl_p:+.1f}%</div>
+                    </div>
+                    <div style="text-align:center; padding:8px; background:{card_bg}; border-radius:8px">
+                        <div style="font-size:0.65rem; color:{sub_color}">Fair Val</div>
+                        <div style="font-size:0.9rem; font-weight:700; color:#58a6ff">${float(r['Fair Value']):.2f}</div>
+                    </div>
+                    <div style="text-align:center; padding:8px; background:{card_bg}; border-radius:8px">
+                        <div style="font-size:0.65rem; color:{sub_color}">RSI</div>
+                        <div style="font-size:0.9rem; font-weight:700; color:{rsi_color}">{rsi:.0f}</div>
+                    </div>
+                    <div style="text-align:center; padding:8px; background:{card_bg}; border-radius:8px">
+                        <div style="font-size:0.65rem; color:{sub_color}">Aantal</div>
+                        <div style="font-size:0.9rem; font-weight:700; color:{text_color}">{float(r['Aantal']):.2f}</div>
+                    </div>
+                    <div style="text-align:center; padding:8px; background:{card_bg}; border-radius:8px">
+                        <div style="font-size:0.65rem; color:{sub_color}">GAK</div>
+                        <div style="font-size:0.9rem; font-weight:700; color:{text_color}">${float(r['GAK']):.2f}</div>
+                    </div>
+                    <div style="text-align:center; padding:8px; background:{card_bg}; border-radius:8px">
+                        <div style="font-size:0.65rem; color:{sub_color}">Div Yield</div>
+                        <div style="font-size:0.9rem; font-weight:700; color:{'#3fb950' if r['Div_Yield'] > 0.02 else sub_color}">{r['Div_Yield']*100:.1f}%</div>
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        st.divider()
+        
+        # ── Portfolio Performance Chart ──
+        st.subheader("📈 Performance Overview (30D)")
+        
+        # Build a combined performance chart for all portfolio stocks
+        perf_fig = go.Figure()
+        for row in rows_sorted[:10]:  # Top 10
+            t = row["Ticker"]
+            df = ticker_data.get(t, pd.DataFrame())
+            if not df.empty and len(df) >= 30:
+                close = df["Close"].tail(30)
+                # Normalize to percentage from start
+                normalized = (close / close.iloc[0] - 1) * 100
+                color = "#3fb950" if float(normalized.iloc[-1]) >= 0 else "#f85149"
+                perf_fig.add_trace(go.Scatter(
+                    x=df.index[-30:], y=normalized, 
+                    name=f"{t} ({float(normalized.iloc[-1]):+.1f}%)",
+                    line=dict(width=2),
+                    hovertemplate=f"{t}: %{{y:+.2f}}%<extra></extra>"
+                ))
+        
+        perf_fig.add_hline(y=0, line_dash="dash", line_color="#8b949e", opacity=0.5)
+        perf_fig.update_layout(
+            template="plotly_dark" if st.session_state.theme == "dark" else "plotly_white",
+            height=350,
+            margin=dict(l=10, r=10, t=10, b=10),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=10)),
+            yaxis_title="Return %",
+            xaxis_title="",
+        )
+        st.plotly_chart(perf_fig, use_container_width=True)
         
         st.divider()
         
@@ -2728,7 +3099,7 @@ with tab1:
                     hole=0.3,
                     marker=dict(colors=["#3fb950", "#f85149", "#58a6ff", "#e3b341", "#bc8ef7", "#79c0ff"])
                 )])
-                fig_pie.update_layout(template="plotly_dark", height=350, title="Sector Allocation")
+                fig_pie.update_layout(template="plotly_dark" if st.session_state.theme == "dark" else "plotly_white", height=350, title="Sector Allocation")
                 st.plotly_chart(fig_pie, use_container_width=True)
         
         # Position sizes (bar)
@@ -2746,7 +3117,7 @@ with tab1:
                 textposition="outside",
             ))
             fig_bar.update_layout(
-                template="plotly_dark",
+                template="plotly_dark" if st.session_state.theme == "dark" else "plotly_white",
                 height=350,
                 title="Position Sizes & Returns",
                 showlegend=False,
@@ -3015,7 +3386,6 @@ with tab2:
                     padding:15px;
                     margin-bottom:15px;
                 ">
-                    <!-- Header Row - responsive flex wrap -->
                     <div style="display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; margin-bottom:12px; gap:10px">
                         <div style="display:flex; flex-wrap:wrap; align-items:center; gap:8px">
                             <span style="font-size:clamp(1.1rem, 4vw, 1.5rem); font-weight:800; color:#e6edf3">{r['Ticker']}</span>
@@ -3029,7 +3399,6 @@ with tab2:
                         </div>
                     </div>
                     
-                    <!-- Metrics Grid - auto-responsive 2-3-6 columns -->
                     <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(80px, 1fr)); gap:8px; margin-bottom:12px">
                         <div style="text-align:center; padding:6px; background:#161b22; border-radius:8px">
                             <div style="font-size:0.65rem; color:#8b949e">Fair Val</div>
@@ -3057,7 +3426,6 @@ with tab2:
                         </div>
                     </div>
                     
-                    <!-- Performance Row - auto-responsive -->
                     <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(60px, 1fr)); gap:6px; margin-bottom:12px">
                         <div style="text-align:center; padding:5px; background:#0d1117; border-radius:6px">
                             <span style="font-size:0.65rem; color:#8b949e">1D </span>
@@ -3077,7 +3445,6 @@ with tab2:
                         </div>
                     </div>
                     
-                    <!-- 52-Week Range Bar -->
                     <div style="margin-bottom:12px">
                         <div style="display:flex; flex-wrap:wrap; justify-content:space-between; font-size:0.7rem; color:#8b949e; margin-bottom:4px; gap:5px">
                             <span>Low: ${r['Low_52w']:.2f}</span>
@@ -3085,17 +3452,7 @@ with tab2:
                             <span>High: ${r['High_52w']:.2f}</span>
                         </div>
                         <div style="background:#161b22; border-radius:10px; height:10px; position:relative">
-                            <div style="
-                                position:absolute;
-                                left:{r['Range_Position']}%;
-                                top:50%;
-                                transform:translate(-50%, -50%);
-                                width:14px;
-                                height:14px;
-                                background:{'#3fb950' if r['Range_Position'] < 30 else '#f85149' if r['Range_Position'] > 70 else '#58a6ff'};
-                                border-radius:50%;
-                                border:2px solid #e6edf3;
-                            "></div>
+                            <div style="position:absolute; left:{r['Range_Position']}%; top:50%; transform:translate(-50%, -50%); width:14px; height:14px; background:{'#3fb950' if r['Range_Position'] < 30 else '#f85149' if r['Range_Position'] > 70 else '#58a6ff'}; border-radius:50%; border:2px solid #e6edf3;"></div>
                             <div style="width:{r['Range_Position']}%; height:100%; background:linear-gradient(90deg, #3fb950, #e3b341, #f85149); border-radius:10px; opacity:0.3"></div>
                         </div>
                         <div style="text-align:center; font-size:0.75rem; color:#e6edf3; margin-top:4px">
@@ -3103,7 +3460,6 @@ with tab2:
                         </div>
                     </div>
                     
-                    <!-- Entry/Exit Targets - auto-responsive -->
                     <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(90px, 1fr)); gap:10px">
                         <div style="text-align:center; padding:8px; background:#0d2318; border:1px solid #3fb950; border-radius:10px">
                             <div style="font-size:0.7rem; color:#8b949e">🎯 Entry</div>
@@ -3119,7 +3475,6 @@ with tab2:
                         </div>
                     </div>
                     
-                    <!-- Footer info - wrap on mobile -->
                     <div style="margin-top:10px; font-size:0.7rem; color:#6e7681; word-wrap:break-word">
                         {r['Trend']} | {r['Valuation'][:25]} {'| 💰 ' + f"{r['Div_Yield']*100:.1f}%" if r['Div_Yield'] > 0 else ''}
                     </div>
@@ -3169,7 +3524,7 @@ with tab2:
                         break
                 
                 fig.update_layout(
-                    template="plotly_dark",
+                    template="plotly_dark" if st.session_state.theme == "dark" else "plotly_white",
                     height=500,
                     title=f"{selected_wl_ticker} - Price Chart with Indicators",
                     xaxis_title="Date",
@@ -3184,7 +3539,7 @@ with tab2:
                     fig_rsi.add_trace(go.Scatter(x=df_chart.index, y=df_chart['RSI'], name='RSI', line=dict(color='#bc8ef7', width=2)))
                     fig_rsi.add_hline(y=70, line_dash="dash", line_color="#f85149", annotation_text="Overbought")
                     fig_rsi.add_hline(y=30, line_dash="dash", line_color="#3fb950", annotation_text="Oversold")
-                    fig_rsi.update_layout(template="plotly_dark", height=200, title="RSI Indicator", yaxis_range=[0, 100])
+                    fig_rsi.update_layout(template="plotly_dark" if st.session_state.theme == "dark" else "plotly_white", height=200, title="RSI Indicator", yaxis_range=[0, 100])
                     st.plotly_chart(fig_rsi, use_container_width=True)
 
 
@@ -3193,11 +3548,6 @@ with tab2:
 # ════════════════════════════════════════════════════════════════════════════
 with tab3:
     st.header("📊 Portfolio Analytics")
-    st.info("""
-    📊 **Wat zie je hier?**  
-    Analyse van je portfolio diversificatie en risico. Bekijk sector allocatie (pie chart), 
-    totaal rendement en een risico-assessment (low/medium/high) gebaseerd op volatiliteit.
-    """)
     
     if not portfolio_positions:
         st.info("Voeg stocks toe aan je portfolio om analytics te zien.")
@@ -3226,12 +3576,69 @@ with tab3:
             
             col1, col2 = st.columns([2, 1])
             with col1:
-                fig = go.Figure(data=[go.Pie(labels=sector_df['Sector'], values=sector_df['Waarde ($)'])])
-                fig.update_layout(template="plotly_dark", height=400)
+                fig = go.Figure(data=[go.Pie(
+                    labels=sector_df['Sector'], 
+                    values=sector_df['Waarde ($)'],
+                    hole=0.4,
+                    marker=dict(colors=["#3fb950", "#f85149", "#58a6ff", "#e3b341", "#bc8ef7", "#79c0ff", "#f0883e", "#db61a2"])
+                )])
+                fig.update_layout(
+                    template="plotly_dark" if st.session_state.theme == "dark" else "plotly_white",
+                    height=400
+                )
                 st.plotly_chart(fig, use_container_width=True)
             
             with col2:
                 st.dataframe(sector_df[['Sector', 'Percentage']], use_container_width=True, hide_index=True)
+        
+        st.divider()
+        
+        # Correlation Matrix
+        if len(portfolio_positions) > 1:
+            st.subheader("🔗 Correlation Matrix")
+            st.caption("Lage correlatie = betere diversificatie")
+            
+            prices_corr = {}
+            for pos in portfolio_positions[:10]:
+                df_temp = ticker_data.get(pos["ticker"], pd.DataFrame())
+                if not df_temp.empty and len(df_temp) >= 60:
+                    prices_corr[pos["ticker"]] = df_temp["Close"].pct_change().dropna()
+            
+            if len(prices_corr) > 1:
+                corr_df = pd.DataFrame(prices_corr)
+                corr = corr_df.corr()
+                
+                fig_corr = go.Figure(data=go.Heatmap(
+                    z=corr.values,
+                    x=corr.columns,
+                    y=corr.columns,
+                    colorscale='RdBu_r',
+                    zmid=0,
+                    zmin=-1,
+                    zmax=1,
+                    text=[[f"{v:.2f}" for v in row] for row in corr.values],
+                    texttemplate="%{text}",
+                    textfont=dict(size=11),
+                ))
+                fig_corr.update_layout(
+                    template="plotly_dark" if st.session_state.theme == "dark" else "plotly_white",
+                    height=400,
+                    margin=dict(l=10, r=10, t=10, b=10)
+                )
+                st.plotly_chart(fig_corr, use_container_width=True)
+                
+                # Diversification score
+                avg_corr = corr.values[np.triu_indices_from(corr.values, k=1)].mean()
+                if avg_corr < 0.3:
+                    div_score = "🟢 Uitstekend gediversifieerd"
+                elif avg_corr < 0.5:
+                    div_score = "🟡 Redelijk gediversifieerd"
+                elif avg_corr < 0.7:
+                    div_score = "🟠 Matig gediversifieerd"
+                else:
+                    div_score = "🔴 Slecht gediversifieerd - stocks bewegen samen"
+                
+                st.metric("📊 Gem. Correlatie", f"{avg_corr:.2f}", delta=div_score)
         
         st.divider()
         
@@ -3244,20 +3651,39 @@ with tab3:
             if not df.empty and len(df) >= 20:
                 returns = df["Close"].pct_change()
                 vol = returns.std() * 100
-                volatilities.append(vol)
+                volatilities.append({"ticker": pos["ticker"], "volatility": vol})
         
         if volatilities:
-            avg_volatility = sum(volatilities) / len(volatilities)
+            avg_volatility = sum(v["volatility"] for v in volatilities) / len(volatilities)
             if avg_volatility < 2:
-                risk_level = "🟢 Low Risk (Conservative)"
+                risk_level = "🟢 Low Risk"
             elif avg_volatility < 4:
-                risk_level = "🟡 Medium Risk (Balanced)"
+                risk_level = "🟡 Medium Risk"
             else:
-                risk_level = "🔴 High Risk (Aggressive)"
+                risk_level = "🔴 High Risk"
             
             col1, col2 = st.columns(2)
             col1.metric("📈 Portfolio Volatility", f"{avg_volatility:.2f}%")
             col2.metric("⚙️ Risk Level", risk_level)
+            
+            # Per-stock volatility chart
+            vol_df = pd.DataFrame(volatilities).sort_values("volatility", ascending=True)
+            fig_vol = go.Figure(go.Bar(
+                x=vol_df["volatility"],
+                y=vol_df["ticker"],
+                orientation="h",
+                marker_color=["#3fb950" if v < 2 else "#e3b341" if v < 4 else "#f85149" for v in vol_df["volatility"]],
+                text=[f"{v:.2f}%" for v in vol_df["volatility"]],
+                textposition="outside",
+            ))
+            fig_vol.update_layout(
+                template="plotly_dark" if st.session_state.theme == "dark" else "plotly_white",
+                height=max(200, len(volatilities) * 35),
+                margin=dict(l=10, r=50, t=10, b=10),
+                xaxis_title="Daily Volatility %",
+                showlegend=False,
+            )
+            st.plotly_chart(fig_vol, use_container_width=True)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -3358,36 +3784,24 @@ with tab4:
                 # Volume chart
                 if len(df_adv) > 0:
                     fig_vol = go.Figure(data=[
-                        go.Bar(x=df_adv.index[-30:], y=df_adv["Volume"].tail(30), name="Volume")
+                        go.Bar(x=df_adv.index[-30:], y=df_adv["Volume"].tail(30), name="Volume",
+                               marker_color=["#3fb950" if df_adv["Close"].iloc[i] >= df_adv["Open"].iloc[i] else "#f85149" 
+                                            for i in range(-30, 0)])
                     ])
-                    fig_vol.update_layout(template="plotly_dark", height=300, title="30-Day Volume")
+                    fig_vol.update_layout(
+                        template="plotly_dark" if st.session_state.theme == "dark" else "plotly_white",
+                        height=300, title="30-Day Volume"
+                    )
                     st.plotly_chart(fig_vol, use_container_width=True)
                 
                 st.divider()
                 
-                # Correlation (if portfolio has multiple stocks)
-                if len(portfolio_positions) > 1:
-                    st.subheader("🔗 Correlation Matrix")
-                    
-                    # Calculate correlation
-                    prices = {}
-                    for pos in portfolio_positions[:5]:  # Limit to 5 for performance
-                        df_temp = ticker_data.get(pos["ticker"], pd.DataFrame())
-                        if not df_temp.empty:
-                            prices[pos["ticker"]] = df_temp["Close"]
-                    
-                    if len(prices) > 1:
-                        prices_df = pd.DataFrame(prices)
-                        corr = prices_df.corr()
-                        
-                        fig_corr = go.Figure(data=go.Heatmap(
-                            z=corr.values,
-                            x=corr.columns,
-                            y=corr.columns,
-                            colorscale='RdBu'
-                        ))
-                        fig_corr.update_layout(template="plotly_dark", height=400)
-                        st.plotly_chart(fig_corr, use_container_width=True)
+                # Full Technical Chart
+                st.subheader("📈 Technische Chart")
+                fig_tech = build_enhanced_chart(df_adv, selected_ticker_adv, show_bb=True, show_macd=True)
+                if st.session_state.theme == "light":
+                    fig_tech.update_layout(template="plotly_white", paper_bgcolor="#ffffff", plot_bgcolor="#ffffff")
+                st.plotly_chart(fig_tech, use_container_width=True)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -3731,10 +4145,12 @@ with tab9:
     🔔 **Wat zie je hier?**  
     Stel prijs alerts in voor elke stock. Kies een target prijs en of je een melding wilt 
     wanneer de prijs **boven** (koop alert) of **onder** (stop-loss alert) de target komt.
+    **Email alerts** worden automatisch verzonden als je email is geconfigureerd.
     """)
     
     # Load existing alerts
     price_alerts = user_data.get("price_alerts", [])
+    email_config = user_data.get("email_config", {})
     
     # Check triggered alerts
     triggered = check_price_alerts(price_alerts, ticker_data)
@@ -3743,6 +4159,24 @@ with tab9:
         st.subheader("🚨 Triggered Alerts!")
         for alert in triggered:
             st.success(f"{alert['type']}: {alert['message']}")
+        
+        # Email button for triggered alerts
+        if email_config.get("recipient_email"):
+            if st.button("📧 Verstuur Alerts via Email", use_container_width=True, key="send_triggered_email"):
+                email_body = build_alert_email_body(triggered, ticker_data)
+                success, message = send_email_alert(
+                    email_config["recipient_email"],
+                    f"🚨 Stock Alert: {len(triggered)} alerts getriggerd!",
+                    email_body,
+                    email_config
+                )
+                if success:
+                    st.success(message)
+                else:
+                    st.error(message)
+        else:
+            st.caption("💡 Configureer je email in de sidebar om alerts te ontvangen")
+        
         st.divider()
     
     # Add new alert
@@ -3805,6 +4239,76 @@ with tab9:
                 user_data["price_alerts"] = price_alerts
                 save_user_portfolio(st.session_state.current_user, user_data)
                 st.rerun()
+    
+    st.divider()
+    
+    # Email Actions Section
+    st.subheader("📧 Email Acties")
+    
+    email_status = "✅ Geconfigureerd" if email_config.get("recipient_email") else "❌ Niet geconfigureerd"
+    recipient = email_config.get("recipient_email", "Geen")
+    
+    _email_bg = "#161b22" if st.session_state.theme == "dark" else "#f0f2f5"
+    st.markdown(f"""
+    <div style="background:{_email_bg}; padding:15px; border-radius:10px; margin-bottom:15px">
+        <div style="display:flex; justify-content:space-between; flex-wrap:wrap; gap:10px">
+            <div><b>Email Status:</b> {email_status}</div>
+            <div><b>Ontvanger:</b> {recipient}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    email_action_cols = st.columns(2)
+    
+    with email_action_cols[0]:
+        if st.button("📊 Verstuur Portfolio Overzicht", use_container_width=True, key="send_portfolio_email"):
+            if email_config.get("recipient_email") and email_config.get("sender_email"):
+                email_body = build_portfolio_summary_email(portfolio_positions, ticker_data)
+                success, message = send_email_alert(
+                    email_config["recipient_email"],
+                    f"📊 Portfolio Overzicht - {datetime.now().strftime('%d %b %Y')}",
+                    email_body,
+                    email_config
+                )
+                if success:
+                    st.success(message)
+                else:
+                    st.error(message)
+            else:
+                st.error("⚠️ Configureer eerst je email in de sidebar")
+    
+    with email_action_cols[1]:
+        if st.button("🔔 Verstuur Alle Actieve Alerts", use_container_width=True, key="send_all_alerts_email"):
+            if email_config.get("recipient_email") and email_config.get("sender_email"):
+                if price_alerts:
+                    # Build summary of all active alerts
+                    body = "<h2>📋 Actieve Price Alerts</h2>"
+                    for alert in price_alerts:
+                        current_p = latest(alert["ticker"], "Close")
+                        diff = ((current_p - alert["target_price"]) / alert["target_price"] * 100) if alert["target_price"] > 0 else 0
+                        body += f"""
+                        <div style="background:#161b22; padding:12px; border-radius:8px; margin:8px 0; border-left:4px solid {'#3fb950' if alert['type'] == 'above' else '#f85149'}">
+                            <b style="font-size:16px">{alert['ticker']}</b><br>
+                            <b>Type:</b> {'📈 Boven' if alert['type'] == 'above' else '📉 Onder'}<br>
+                            <b>Target:</b> ${alert['target_price']:.2f}<br>
+                            <b>Huidige prijs:</b> ${current_p:.2f} ({diff:+.1f}% van target)
+                        </div>
+                        """
+                    
+                    success, message = send_email_alert(
+                        email_config["recipient_email"],
+                        f"📋 Actieve Alerts Overzicht - {len(price_alerts)} alerts",
+                        body,
+                        email_config
+                    )
+                    if success:
+                        st.success(message)
+                    else:
+                        st.error(message)
+                else:
+                    st.info("Geen actieve alerts om te versturen")
+            else:
+                st.error("⚠️ Configureer eerst je email in de sidebar")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -3849,7 +4353,7 @@ with tab10:
         ))
         
         fig_history.update_layout(
-            template="plotly_dark",
+            template="plotly_dark" if st.session_state.theme == "dark" else "plotly_white",
             height=400,
             title="Portfolio Performance",
             xaxis_title="Datum",
@@ -4603,6 +5107,840 @@ with chart_col:
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.warning(f"Geen data beschikbaar voor **{selected_ticker}**.")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 13 – Earnings Calendar
+# ════════════════════════════════════════════════════════════════════════════
+with tab13:
+    st.header("📅 Earnings Calendar")
+    st.info("""
+    📅 **Wat zie je hier?**  
+    Overzicht van aankomende earnings reports voor jouw stocks. 
+    Zie wanneer bedrijven rapporteren, hoeveel dagen tot earnings, en historische earnings surprises.
+    """)
+    
+    @st.cache_data(ttl=3600)  # Cache for 1 hour
+    def get_earnings_data(ticker: str) -> dict:
+        """Fetch earnings data for a ticker using multiple methods."""
+        try:
+            stock = yf.Ticker(ticker)
+            
+            # Method 1: Try earnings_dates (most reliable for history)
+            earnings_dates_df = None
+            try:
+                earnings_dates_df = stock.earnings_dates
+            except:
+                pass
+            
+            # Method 2: Try calendar
+            calendar = None
+            try:
+                calendar = stock.calendar
+            except:
+                pass
+            
+            # Method 3: Try quarterly_earnings
+            quarterly_earnings = None
+            try:
+                quarterly_earnings = stock.quarterly_earnings
+            except:
+                pass
+            
+            # Get next earnings date
+            next_earnings = None
+            earnings_time = "N/A"
+            
+            # Try to get next earnings from earnings_dates (future dates)
+            if earnings_dates_df is not None and not earnings_dates_df.empty:
+                try:
+                    now = pd.Timestamp.now(tz='UTC') if earnings_dates_df.index.tz else pd.Timestamp.now()
+                    future_dates = earnings_dates_df[earnings_dates_df.index > now]
+                    if not future_dates.empty:
+                        next_earnings = future_dates.index[0]
+                except Exception:
+                    # Fallback: just get the most recent index
+                    try:
+                        next_earnings = earnings_dates_df.index[0]
+                    except:
+                        pass
+            
+            # Fallback to calendar if no earnings_dates
+            if next_earnings is None and calendar is not None:
+                try:
+                    if isinstance(calendar, pd.DataFrame) and not calendar.empty:
+                        # Calendar can be DataFrame with index containing 'Earnings Date'
+                        if 'Earnings Date' in calendar.index:
+                            val = calendar.loc['Earnings Date'].iloc[0]
+                            next_earnings = pd.to_datetime(val)
+                        elif 'Earnings Date' in calendar.columns:
+                            next_earnings = pd.to_datetime(calendar['Earnings Date'].iloc[0])
+                    elif isinstance(calendar, dict):
+                        if 'Earnings Date' in calendar:
+                            dates = calendar['Earnings Date']
+                            if dates:
+                                next_earnings = pd.to_datetime(dates[0] if isinstance(dates, list) else dates)
+                except Exception:
+                    pass
+            
+            # Get historical earnings surprises
+            surprises = []
+            
+            # Method A: From earnings_dates
+            if earnings_dates_df is not None and not earnings_dates_df.empty:
+                cols = earnings_dates_df.columns.tolist()
+                
+                for idx, row in earnings_dates_df.head(12).iterrows():
+                    try:
+                        # Handle timezone-aware datetime
+                        if hasattr(idx, 'tz') and idx.tz is not None:
+                            idx_naive = idx.tz_localize(None)
+                        else:
+                            idx_naive = idx
+                        
+                        # Try different column name formats
+                        surprise_pct = None
+                        reported_eps = None
+                        estimated_eps = None
+                        
+                        for col in cols:
+                            col_lower = col.lower()
+                            if 'surprise' in col_lower and '%' in col_lower:
+                                surprise_pct = row[col]
+                            elif 'surprise' in col_lower:
+                                surprise_pct = row[col]
+                            elif 'reported' in col_lower or 'actual' in col_lower:
+                                reported_eps = row[col]
+                            elif 'estimate' in col_lower:
+                                estimated_eps = row[col]
+                        
+                        # Check if values are valid
+                        if pd.notna(reported_eps) or pd.notna(surprise_pct):
+                            surprises.append({
+                                "date": idx_naive.strftime('%Y-%m-%d') if hasattr(idx_naive, 'strftime') else str(idx)[:10],
+                                "reported_eps": float(reported_eps) if pd.notna(reported_eps) else None,
+                                "estimated_eps": float(estimated_eps) if pd.notna(estimated_eps) else None,
+                                "surprise_pct": float(surprise_pct) if pd.notna(surprise_pct) else None,
+                            })
+                    except Exception:
+                        continue
+            
+            # Method B: From quarterly_earnings if no surprises found
+            if not surprises and quarterly_earnings is not None and not quarterly_earnings.empty:
+                try:
+                    for idx, row in quarterly_earnings.head(12).iterrows():
+                        reported = row.get('Earnings', None) or row.get('Actual', None)
+                        if pd.notna(reported):
+                            surprises.append({
+                                "date": str(idx)[:10] if idx else "N/A",
+                                "reported_eps": float(reported),
+                                "estimated_eps": None,
+                                "surprise_pct": None,
+                            })
+                except Exception:
+                    pass
+            
+            return {
+                "next_earnings": next_earnings,
+                "earnings_time": earnings_time,
+                "surprises": surprises,
+            }
+        except Exception as e:
+            return {"next_earnings": None, "earnings_time": "N/A", "surprises": [], "error": str(e)}
+    
+    if not all_tickers:
+        st.info("Voeg stocks toe aan je portfolio of watchlist om earnings te zien.")
+    else:
+        # Fetch earnings data for all tickers
+        earnings_data = {}
+        upcoming_earnings = []
+        
+        with st.spinner("📅 Earnings data ophalen..."):
+            for t in all_tickers:
+                data = get_earnings_data(t)
+                earnings_data[t] = data
+                
+                # Check if earnings date is available and upcoming
+                if data.get("next_earnings") is not None:
+                    try:
+                        earnings_date = pd.to_datetime(data["next_earnings"])
+                        # Remove timezone info for comparison
+                        if hasattr(earnings_date, 'tz') and earnings_date.tz is not None:
+                            earnings_date = earnings_date.tz_localize(None)
+                        
+                        now = pd.Timestamp.now()
+                        days_until = (earnings_date - now).days
+                        
+                        if days_until >= -1:  # Include today and future
+                            upcoming_earnings.append({
+                                "ticker": t,
+                                "date": earnings_date,
+                                "days_until": days_until,
+                            })
+                    except Exception:
+                        pass
+        
+        # Sort by days until earnings
+        upcoming_earnings = sorted(upcoming_earnings, key=lambda x: x["days_until"])
+        
+        # ── Summary ──
+        st.subheader("📊 Earnings Overview")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        this_week = sum(1 for e in upcoming_earnings if 0 <= e["days_until"] <= 7)
+        next_week = sum(1 for e in upcoming_earnings if 7 < e["days_until"] <= 14)
+        this_month = sum(1 for e in upcoming_earnings if 0 <= e["days_until"] <= 30)
+        
+        col1.metric("📅 This Week", this_week, help="Earnings in de komende 7 dagen")
+        col2.metric("📆 Next Week", next_week, help="Earnings over 7-14 dagen")
+        col3.metric("🗓️ This Month", this_month, help="Earnings in de komende 30 dagen")
+        col4.metric("📋 Total Tracked", len(all_tickers))
+        
+        st.divider()
+        
+        # ── Upcoming Earnings Timeline ──
+        st.subheader("⏰ Upcoming Earnings")
+        
+        if upcoming_earnings:
+            for e in upcoming_earnings[:15]:  # Show top 15
+                days = e["days_until"]
+                
+                # Determine urgency color
+                if days <= 2:
+                    bg_color = "#3d1515" if st.session_state.theme == "dark" else "#ffe0e0"
+                    border_color = "#f85149"
+                    urgency = "🔴 IMMINENT"
+                elif days <= 7:
+                    bg_color = "#3d3010" if st.session_state.theme == "dark" else "#fff3cd"
+                    border_color = "#e3b341"
+                    urgency = "🟡 This Week"
+                elif days <= 14:
+                    bg_color = "#1a2332" if st.session_state.theme == "dark" else "#cce5ff"
+                    border_color = "#58a6ff"
+                    urgency = "🔵 Next Week"
+                else:
+                    bg_color = "#1c1f26" if st.session_state.theme == "dark" else "#f0f0f0"
+                    border_color = "#2e3140" if st.session_state.theme == "dark" else "#ccc"
+                    urgency = "⚪ Upcoming"
+                
+                date_str = e["date"].strftime('%a, %d %b %Y') if hasattr(e["date"], 'strftime') else str(e["date"])
+                
+                st.markdown(f"""
+                <div style="
+                    background:{bg_color};
+                    border:2px solid {border_color};
+                    border-radius:12px;
+                    padding:15px 20px;
+                    margin-bottom:10px;
+                    display:flex;
+                    flex-wrap:wrap;
+                    justify-content:space-between;
+                    align-items:center;
+                    gap:10px;
+                ">
+                    <div style="display:flex; align-items:center; gap:15px; flex-wrap:wrap">
+                        <span style="font-size:1.3rem; font-weight:800; color:#e6edf3">{e['ticker']}</span>
+                        <span style="padding:4px 12px; background:{border_color}; border-radius:20px; font-weight:700; color:#000; font-size:0.8rem">
+                            {urgency}
+                        </span>
+                    </div>
+                    <div style="text-align:right">
+                        <div style="font-size:1.1rem; font-weight:700; color:#58a6ff">{date_str}</div>
+                        <div style="font-size:0.9rem; color:#8b949e">
+                            {'📢 TODAY!' if days == 0 else f'⏳ {days} dag{"en" if days != 1 else ""} te gaan'}
+                        </div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.info("Geen aankomende earnings gevonden voor je stocks.")
+        
+        st.divider()
+        
+        # ── All Stocks Earnings Status ──
+        st.subheader("📋 Earnings Status per Stock")
+        status_data = []
+        for t in all_tickers:
+            data = earnings_data.get(t, {})
+            next_e = data.get("next_earnings")
+            n_surprises = len(data.get("surprises", []))
+            
+            if next_e is not None:
+                try:
+                    ed = pd.to_datetime(next_e)
+                    if hasattr(ed, 'tz') and ed.tz is not None:
+                        ed = ed.tz_localize(None)
+                    days = (ed - pd.Timestamp.now()).days
+                    date_str = ed.strftime('%d %b %Y')
+                    status = f"📅 {date_str} ({days}d)"
+                except Exception:
+                    status = f"📅 {str(next_e)[:10]}"
+            else:
+                status = "❓ Niet beschikbaar"
+            
+            status_data.append({"Ticker": t, "Next Earnings": status, "History": f"{n_surprises} kwartalen"})
+        
+        if status_data:
+            st.dataframe(pd.DataFrame(status_data), use_container_width=True, hide_index=True)
+        
+        st.divider()
+        
+        # ── Historical Earnings Surprises ──
+        st.subheader("📈 Historical Earnings Surprises")
+        
+        selected_ticker_earnings = st.selectbox(
+            "Selecteer stock voor earnings history",
+            options=all_tickers,
+            key="earnings_history_select"
+        )
+        
+        if selected_ticker_earnings:
+            data = earnings_data.get(selected_ticker_earnings, {})
+            surprises = data.get("surprises", [])
+            
+            if surprises:
+                # Build chart
+                dates = [s["date"] for s in surprises if s.get("surprise_pct") is not None]
+                surprise_pcts = [s["surprise_pct"] for s in surprises if s.get("surprise_pct") is not None]
+                
+                if dates and surprise_pcts:
+                    fig = go.Figure()
+                    
+                    colors = ["#3fb950" if s >= 0 else "#f85149" for s in surprise_pcts]
+                    
+                    fig.add_trace(go.Bar(
+                        x=dates,
+                        y=surprise_pcts,
+                        marker_color=colors,
+                        text=[f"{s:+.1f}%" for s in surprise_pcts],
+                        textposition="outside",
+                    ))
+                    
+                    fig.add_hline(y=0, line_dash="dash", line_color="#8b949e")
+                    
+                    fig.update_layout(
+                        template="plotly_dark" if st.session_state.theme == "dark" else "plotly_white",
+                        height=350,
+                        title=f"{selected_ticker_earnings} - Earnings Surprise History",
+                        xaxis_title="Earnings Date",
+                        yaxis_title="Surprise %",
+                        showlegend=False
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                # Table view
+                st.markdown("**📋 Details:**")
+                for s in surprises:
+                    if s.get("reported_eps") is not None:
+                        surprise_color = "#3fb950" if (s.get("surprise_pct") or 0) >= 0 else "#f85149"
+                        surprise_emoji = "✅" if (s.get("surprise_pct") or 0) >= 0 else "❌"
+                        
+                        est_str = f"Est: ${s['estimated_eps']:.2f}" if s.get("estimated_eps") else "Est: N/A"
+                        rep_str = f"${s['reported_eps']:.2f}"
+                        surp_str = f"{s['surprise_pct']:+.1f}%" if s.get("surprise_pct") else "N/A"
+                        
+                        st.markdown(f"""
+                        <div style="display:flex; flex-wrap:wrap; gap:10px; padding:8px 0; border-bottom:1px solid #2e3140; align-items:center">
+                            <span style="min-width:100px; color:#8b949e">{s['date']}</span>
+                            <span style="min-width:80px">{est_str}</span>
+                            <span style="min-width:80px; font-weight:700">→ {rep_str}</span>
+                            <span style="font-weight:700; color:{surprise_color}">{surprise_emoji} {surp_str}</span>
+                        </div>
+                        """, unsafe_allow_html=True)
+            else:
+                st.info(f"Geen earnings history beschikbaar voor {selected_ticker_earnings}")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 14 – News Feed
+# ════════════════════════════════════════════════════════════════════════════
+with tab14:
+    st.header("📰 News Feed")
+    st.info("""
+    📰 **Wat zie je hier?**  
+    Laatste nieuws voor jouw stocks met automatische sentiment analyse. 
+    Blijf op de hoogte van belangrijke ontwikkelingen die je posities kunnen beïnvloeden.
+    """)
+    
+    @st.cache_data(ttl=600)  # Cache for 10 minutes
+    def get_stock_news(ticker: str) -> list:
+        """Fetch news for a ticker - handles multiple yfinance API versions."""
+        try:
+            stock = yf.Ticker(ticker)
+            news = stock.news
+            
+            if not news:
+                return []
+            
+            articles = []
+            for item in news[:10]:
+                # Handle both old and new yfinance API formats
+                title = item.get("title", "")
+                publisher = item.get("publisher", "")
+                link = item.get("link", "#")
+                published = item.get("providerPublishTime", 0)
+                
+                # New yfinance format wraps content differently
+                if not title and "content" in item:
+                    content = item.get("content", {})
+                    title = content.get("title", item.get("title", "No title"))
+                    publisher = content.get("provider", {}).get("displayName", "Unknown")
+                    link = content.get("canonicalUrl", {}).get("url", item.get("link", "#"))
+                    pub_date = content.get("pubDate", "")
+                    if pub_date:
+                        try:
+                            published = int(pd.to_datetime(pub_date).timestamp())
+                        except Exception:
+                            published = 0
+                
+                if not title:
+                    title = "No title"
+                if not publisher:
+                    publisher = "Unknown"
+                
+                # Handle thumbnail
+                thumbnail = None
+                try:
+                    if "thumbnail" in item:
+                        thumbnail = item["thumbnail"].get("resolutions", [{}])[0].get("url")
+                    elif "content" in item:
+                        thumb = item["content"].get("thumbnail", {})
+                        if thumb and "resolutions" in thumb:
+                            thumbnail = thumb["resolutions"][0].get("url")
+                except Exception:
+                    pass
+                
+                articles.append({
+                    "title": title,
+                    "publisher": publisher,
+                    "link": link,
+                    "published": published,
+                    "thumbnail": thumbnail,
+                })
+            
+            return articles
+        except Exception:
+            return []
+    
+    def analyze_sentiment(text: str) -> tuple:
+        """Simple sentiment analysis based on keywords."""
+        text_lower = text.lower()
+        
+        # Positive keywords
+        positive_words = [
+            'surge', 'soar', 'jump', 'gain', 'rise', 'climb', 'rally', 'beat', 'exceed',
+            'upgrade', 'bullish', 'growth', 'profit', 'success', 'record', 'breakthrough',
+            'innovative', 'strong', 'positive', 'optimistic', 'outperform', 'buy', 'winner',
+            'boom', 'skyrocket', 'best', 'high', 'up', 'boost', 'advantage'
+        ]
+        
+        # Negative keywords
+        negative_words = [
+            'fall', 'drop', 'plunge', 'crash', 'decline', 'sink', 'tumble', 'miss', 'cut',
+            'downgrade', 'bearish', 'loss', 'fail', 'weak', 'negative', 'pessimistic',
+            'underperform', 'sell', 'loser', 'bust', 'worst', 'low', 'down', 'risk',
+            'warning', 'concern', 'fear', 'lawsuit', 'investigation', 'recall'
+        ]
+        
+        pos_count = sum(1 for word in positive_words if word in text_lower)
+        neg_count = sum(1 for word in negative_words if word in text_lower)
+        
+        if pos_count > neg_count:
+            score = min(100, 50 + (pos_count - neg_count) * 10)
+            return ("🟢 Bullish", score, "#3fb950")
+        elif neg_count > pos_count:
+            score = max(0, 50 - (neg_count - pos_count) * 10)
+            return ("🔴 Bearish", score, "#f85149")
+        else:
+            return ("🟡 Neutral", 50, "#e3b341")
+    
+    if not all_tickers:
+        st.info("Voeg stocks toe aan je portfolio of watchlist om nieuws te zien.")
+    else:
+        # News source selector
+        news_mode = st.radio(
+            "Toon nieuws voor:",
+            ["🔥 Alle Stocks", "📁 Portfolio Only", "👁️ Watchlist Only", "🔍 Specifieke Stock"],
+            horizontal=True,
+            key="news_mode"
+        )
+        
+        # Determine which tickers to show news for
+        if news_mode == "📁 Portfolio Only":
+            news_tickers = [p["ticker"] for p in portfolio_positions]
+        elif news_mode == "👁️ Watchlist Only":
+            news_tickers = watchlist_tickers
+        elif news_mode == "🔍 Specifieke Stock":
+            selected_news_ticker = st.selectbox("Selecteer stock", all_tickers, key="news_ticker_select")
+            news_tickers = [selected_news_ticker] if selected_news_ticker else []
+        else:
+            news_tickers = all_tickers[:10]  # Limit to 10 for performance
+        
+        st.divider()
+        
+        # ── Sentiment Summary ──
+        if news_mode != "🔍 Specifieke Stock":
+            st.subheader("📊 Sentiment Overview")
+            
+            all_news = []
+            sentiment_summary = {"bullish": 0, "bearish": 0, "neutral": 0}
+            
+            with st.spinner("📰 Nieuws ophalen..."):
+                for t in news_tickers:
+                    articles = get_stock_news(t)
+                    for article in articles:
+                        sentiment, score, color = analyze_sentiment(article["title"])
+                        article["ticker"] = t
+                        article["sentiment"] = sentiment
+                        article["sentiment_score"] = score
+                        article["sentiment_color"] = color
+                        all_news.append(article)
+                        
+                        if "Bullish" in sentiment:
+                            sentiment_summary["bullish"] += 1
+                        elif "Bearish" in sentiment:
+                            sentiment_summary["bearish"] += 1
+                        else:
+                            sentiment_summary["neutral"] += 1
+            
+            # Sentiment metrics
+            total_articles = len(all_news)
+            if total_articles > 0:
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("📰 Total Articles", total_articles)
+                col2.metric("🟢 Bullish", sentiment_summary["bullish"], 
+                           delta=f"{sentiment_summary['bullish']/total_articles*100:.0f}%")
+                col3.metric("🔴 Bearish", sentiment_summary["bearish"],
+                           delta=f"-{sentiment_summary['bearish']/total_articles*100:.0f}%" if sentiment_summary["bearish"] > 0 else None)
+                col4.metric("🟡 Neutral", sentiment_summary["neutral"])
+            
+            st.divider()
+        
+        # ── News Articles ──
+        st.subheader("📰 Latest News")
+        
+        # Sort by published time (most recent first)
+        if news_mode == "🔍 Specifieke Stock":
+            with st.spinner("📰 Nieuws ophalen..."):
+                all_news = []
+                for t in news_tickers:
+                    articles = get_stock_news(t)
+                    for article in articles:
+                        sentiment, score, color = analyze_sentiment(article["title"])
+                        article["ticker"] = t
+                        article["sentiment"] = sentiment
+                        article["sentiment_score"] = score
+                        article["sentiment_color"] = color
+                        all_news.append(article)
+        
+        all_news = sorted(all_news, key=lambda x: x.get("published", 0), reverse=True)
+        
+        if all_news:
+            for article in all_news[:20]:  # Show max 20 articles
+                published_time = datetime.fromtimestamp(article["published"]).strftime('%d %b %Y, %H:%M') if article["published"] else "Unknown"
+                
+                # Card color based on sentiment
+                if "Bullish" in article["sentiment"]:
+                    bg_color = "#0d2318"
+                    border_color = "#3fb950"
+                elif "Bearish" in article["sentiment"]:
+                    bg_color = "#1a0d0d"
+                    border_color = "#f85149"
+                else:
+                    bg_color = "#1c1f26"
+                    border_color = "#2e3140"
+                
+                st.markdown(f"""
+                <div style="
+                    background:{bg_color};
+                    border:2px solid {border_color};
+                    border-radius:12px;
+                    padding:15px;
+                    margin-bottom:12px;
+                ">
+                    <div style="display:flex; flex-wrap:wrap; justify-content:space-between; align-items:flex-start; gap:10px; margin-bottom:8px">
+                        <div style="flex:1; min-width:200px">
+                            <a href="{article['link']}" target="_blank" style="
+                                font-size:1.05rem; 
+                                font-weight:700; 
+                                color:#e6edf3; 
+                                text-decoration:none;
+                                line-height:1.4;
+                            ">{article['title']}</a>
+                        </div>
+                        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap">
+                            <span style="padding:4px 10px; background:#1a2332; border-radius:15px; font-weight:700; color:#58a6ff; font-size:0.8rem">
+                                {article['ticker']}
+                            </span>
+                            <span style="padding:4px 10px; background:{article['sentiment_color']}20; border:1px solid {article['sentiment_color']}; border-radius:15px; font-weight:600; color:{article['sentiment_color']}; font-size:0.75rem">
+                                {article['sentiment']}
+                            </span>
+                        </div>
+                    </div>
+                    <div style="display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; font-size:0.8rem; color:#8b949e">
+                        <span>📰 {article['publisher']}</span>
+                        <span>🕐 {published_time}</span>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.info("Geen nieuws gevonden voor de geselecteerde stocks.")
+        
+        # ── Quick Links ──
+        st.divider()
+        st.subheader("🔗 Quick Links")
+        
+        link_cols = st.columns(4)
+        for idx, t in enumerate(news_tickers[:4]):
+            with link_cols[idx]:
+                st.markdown(f"""
+                <div style="text-align:center; padding:15px; background:#1c1f26; border-radius:10px; border:1px solid #2e3140">
+                    <div style="font-weight:700; color:#e6edf3; margin-bottom:8px">{t}</div>
+                    <a href="https://finance.yahoo.com/quote/{t}" target="_blank" style="color:#58a6ff; font-size:0.85rem">Yahoo Finance →</a><br>
+                    <a href="https://www.google.com/search?q={t}+stock+news" target="_blank" style="color:#58a6ff; font-size:0.85rem">Google News →</a>
+                </div>
+                """, unsafe_allow_html=True)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 15 – Stock Screener
+# ════════════════════════════════════════════════════════════════════════════
+with tab15:
+    st.header("🔍 Stock Screener")
+    
+    st.markdown("""
+    Scan 60+ populaire stocks met filters op RSI, trend, fair value en fundamentals.
+    Vind de beste kansen op basis van jouw criteria.
+    """)
+    
+    # Screener filters
+    st.subheader("⚙️ Filters")
+    
+    fcol1, fcol2, fcol3 = st.columns(3)
+    
+    with fcol1:
+        rsi_filter = st.slider("RSI Range", 0, 100, (0, 70), key="scr_rsi")
+        min_upside = st.number_input("Min Fair Value Upside (%)", value=0.0, step=5.0, key="scr_upside")
+    
+    with fcol2:
+        trend_filter = st.multiselect(
+            "Trend", 
+            options=["🟢 Bullish", "🔴 Bearish"],
+            default=["🟢 Bullish", "🔴 Bearish"],
+            key="scr_trend"
+        )
+        signal_filter = st.multiselect(
+            "Signal",
+            options=["BUY", "HOLD", "SELL"],
+            default=["BUY", "HOLD", "SELL"],
+            key="scr_signal"
+        )
+    
+    with fcol3:
+        sector_filter = st.multiselect(
+            "Sector (laat leeg = alle)",
+            options=["Technology", "Financial Services", "Healthcare", "Consumer Cyclical", 
+                     "Communication Services", "Consumer Defensive", "Energy", "Industrials"],
+            key="scr_sector"
+        )
+        sort_by = st.selectbox(
+            "Sorteer op",
+            options=["Fair Value Upside", "RSI (laag → hoog)", "Daily Change", "Buy Score"],
+            key="scr_sort"
+        )
+    
+    # Run screener
+    if st.button("🔍 Start Screener", use_container_width=True, type="primary", key="run_screener"):
+        # Ensure popular stocks data is loaded
+        screener_tickers = list(set(all_tickers + popular_tickers_list))
+        
+        screener_results = []
+        progress = st.progress(0, text="Scanning stocks...")
+        
+        for i, t in enumerate(screener_tickers):
+            progress.progress((i + 1) / len(screener_tickers), text=f"Scanning {t}...")
+            
+            # Fetch data if not cached
+            if t not in ticker_data:
+                ticker_data[t] = fetch_data(t)
+            
+            df = ticker_data.get(t, pd.DataFrame())
+            if df.empty or len(df) < 30:
+                continue
+            
+            price = float(df["Close"].iloc[-1])
+            if price <= 0:
+                continue
+            
+            # Calculate indicators
+            rsi = float(df["RSI"].iloc[-1]) if "RSI" in df.columns and not pd.isna(df["RSI"].iloc[-1]) else 50
+            sma200 = float(df["SMA200"].iloc[-1]) if "SMA200" in df.columns and not pd.isna(df["SMA200"].iloc[-1]) else price
+            sma50 = float(df["SMA50"].iloc[-1]) if "SMA50" in df.columns and not pd.isna(df["SMA50"].iloc[-1]) else price
+            daily_chg = float(df["Change_Pct"].iloc[-1]) if "Change_Pct" in df.columns and not pd.isna(df["Change_Pct"].iloc[-1]) else 0
+            
+            fair_val = calculate_fair_value(df, price, t)
+            upside = fair_val["upside"]
+            signal = classify_status(price, sma200, rsi, df, fair_val["fair_value"])
+            
+            trend = "🟢 Bullish" if price > sma200 else "🔴 Bearish"
+            
+            info = fetch_ticker_info(t)
+            sector = info.get("sector", "Unknown")
+            pe = info.get("pe_ratio")
+            div_yield = info.get("dividend_yield", 0) or 0
+            
+            # Apply filters
+            if rsi < rsi_filter[0] or rsi > rsi_filter[1]:
+                continue
+            if upside < min_upside:
+                continue
+            if trend_filter and trend not in trend_filter:
+                continue
+            if signal_filter and signal not in signal_filter:
+                continue
+            if sector_filter and sector not in sector_filter:
+                continue
+            
+            # Calculate buy score
+            buy_score = 50
+            if rsi < 30: buy_score += 20
+            elif rsi < 40: buy_score += 10
+            elif rsi > 70: buy_score -= 15
+            if upside > 20: buy_score += 20
+            elif upside > 10: buy_score += 10
+            elif upside < -10: buy_score -= 10
+            if trend == "🟢 Bullish": buy_score += 5
+            buy_score = max(0, min(100, buy_score))
+            
+            # 52w range position
+            high_52w = float(df["High"].tail(252).max()) if len(df) >= 252 else float(df["High"].max())
+            low_52w = float(df["Low"].tail(252).min()) if len(df) >= 252 else float(df["Low"].min())
+            range_pos = ((price - low_52w) / (high_52w - low_52w) * 100) if (high_52w - low_52w) > 0 else 50
+            
+            screener_results.append({
+                "Ticker": t,
+                "Price": price,
+                "Daily": daily_chg,
+                "RSI": rsi,
+                "Signal": signal,
+                "Trend": trend,
+                "Upside": upside,
+                "FV": fair_val["fair_value"],
+                "Sector": sector,
+                "P/E": pe,
+                "Div": div_yield,
+                "Score": buy_score,
+                "52W Pos": range_pos,
+            })
+        
+        progress.empty()
+        
+        # Sort results
+        if sort_by == "Fair Value Upside":
+            screener_results.sort(key=lambda x: x["Upside"], reverse=True)
+        elif sort_by == "RSI (laag → hoog)":
+            screener_results.sort(key=lambda x: x["RSI"])
+        elif sort_by == "Daily Change":
+            screener_results.sort(key=lambda x: x["Daily"], reverse=True)
+        elif sort_by == "Buy Score":
+            screener_results.sort(key=lambda x: x["Score"], reverse=True)
+        
+        # Store in session state
+        st.session_state.screener_results = screener_results
+    
+    # Display results
+    if "screener_results" in st.session_state and st.session_state.screener_results:
+        results = st.session_state.screener_results
+        
+        st.subheader(f"📊 {len(results)} Resultaten")
+        
+        # Summary
+        scol1, scol2, scol3, scol4 = st.columns(4)
+        buy_count = sum(1 for r in results if r["Signal"] == "BUY")
+        avg_upside = sum(r["Upside"] for r in results) / len(results) if results else 0
+        avg_rsi = sum(r["RSI"] for r in results) / len(results) if results else 50
+        
+        scol1.metric("🟢 Buy Signals", buy_count)
+        scol2.metric("📈 Gem. Upside", f"{avg_upside:+.1f}%")
+        scol3.metric("📊 Gem. RSI", f"{avg_rsi:.0f}")
+        scol4.metric("🔍 Gevonden", len(results))
+        
+        st.divider()
+        
+        # Results cards
+        for r in results[:25]:
+            pnl_color = "#3fb950" if r["Upside"] >= 0 else "#f85149"
+            daily_color = "#3fb950" if r["Daily"] >= 0 else "#f85149"
+            signal_color = "#3fb950" if r["Signal"] == "BUY" else ("#f85149" if r["Signal"] == "SELL" else "#e3b341")
+            score_color = "#3fb950" if r["Score"] >= 70 else ("#e3b341" if r["Score"] >= 50 else "#8b949e")
+            rsi_color = "#3fb950" if r["RSI"] < 35 else ("#f85149" if r["RSI"] > 65 else "#e3b341")
+            
+            bg = "#141a24" if st.session_state.theme == "dark" else "#f8fafc"
+            text_color = "#e6edf3" if st.session_state.theme == "dark" else "#000"
+            sub_color = "#8b949e" if st.session_state.theme == "dark" else "#666"
+            card_bg = "#0f1319" if st.session_state.theme == "dark" else "#f0f4f8"
+            
+            # In portfolio check
+            in_portfolio = r["Ticker"] in [p["ticker"] for p in portfolio_positions]
+            portfolio_badge = ' <span style="padding:2px 8px; background:#58a6ff; border-radius:10px; font-size:0.7rem; color:#000; font-weight:700">IN PORTFOLIO</span>' if in_portfolio else ""
+            
+            pe_str = f"{r['P/E']:.1f}" if r["P/E"] else "N/A"
+            
+            st.markdown(f"""
+            <div style="background:{bg}; border:2px solid {'#3fb950' if r['Signal'] == 'BUY' else '#2e3140'}; border-radius:12px; padding:14px; margin-bottom:8px;">
+                <div style="display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:8px; margin-bottom:10px">
+                    <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap">
+                        <span style="font-size:1.3rem; font-weight:800; color:{text_color}">{r['Ticker']}</span>
+                        <span style="padding:3px 10px; background:{signal_color}; border-radius:15px; font-weight:700; color:#000; font-size:0.75rem">{r['Signal']}</span>
+                        <span style="padding:3px 10px; background:{score_color}; border-radius:15px; font-weight:700; color:#000; font-size:0.75rem">{r['Score']}/100</span>
+                        {portfolio_badge}
+                    </div>
+                    <div style="text-align:right">
+                        <span style="font-size:1.15rem; font-weight:700; color:{text_color}">${r['Price']:.2f}</span>
+                        <span style="margin-left:8px; font-weight:700; color:{daily_color}">{r['Daily']:+.2f}%</span>
+                    </div>
+                </div>
+                <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(75px, 1fr)); gap:6px;">
+                    <div style="text-align:center; padding:5px; background:{card_bg}; border-radius:6px">
+                        <div style="font-size:0.6rem; color:{sub_color}">RSI</div>
+                        <div style="font-size:0.85rem; font-weight:700; color:{rsi_color}">{r['RSI']:.0f}</div>
+                    </div>
+                    <div style="text-align:center; padding:5px; background:{card_bg}; border-radius:6px">
+                        <div style="font-size:0.6rem; color:{sub_color}">Fair Value</div>
+                        <div style="font-size:0.85rem; font-weight:700; color:#58a6ff">${r['FV']:.2f}</div>
+                    </div>
+                    <div style="text-align:center; padding:5px; background:{card_bg}; border-radius:6px">
+                        <div style="font-size:0.6rem; color:{sub_color}">Upside</div>
+                        <div style="font-size:0.85rem; font-weight:700; color:{pnl_color}">{r['Upside']:+.1f}%</div>
+                    </div>
+                    <div style="text-align:center; padding:5px; background:{card_bg}; border-radius:6px">
+                        <div style="font-size:0.6rem; color:{sub_color}">P/E</div>
+                        <div style="font-size:0.85rem; font-weight:700; color:{text_color}">{pe_str}</div>
+                    </div>
+                    <div style="text-align:center; padding:5px; background:{card_bg}; border-radius:6px">
+                        <div style="font-size:0.6rem; color:{sub_color}">Trend</div>
+                        <div style="font-size:0.85rem; font-weight:700">{r['Trend']}</div>
+                    </div>
+                    <div style="text-align:center; padding:5px; background:{card_bg}; border-radius:6px">
+                        <div style="font-size:0.6rem; color:{sub_color}">Sector</div>
+                        <div style="font-size:0.7rem; font-weight:600; color:{text_color}">{r['Sector'][:12]}</div>
+                    </div>
+                    <div style="text-align:center; padding:5px; background:{card_bg}; border-radius:6px">
+                        <div style="font-size:0.6rem; color:{sub_color}">52W Pos</div>
+                        <div style="font-size:0.85rem; font-weight:700; color:{'#3fb950' if r['52W Pos'] < 30 else '#f85149' if r['52W Pos'] > 70 else '#e3b341'}">{r['52W Pos']:.0f}%</div>
+                    </div>
+                    <div style="text-align:center; padding:5px; background:{card_bg}; border-radius:6px">
+                        <div style="font-size:0.6rem; color:{sub_color}">Dividend</div>
+                        <div style="font-size:0.85rem; font-weight:700; color:{'#3fb950' if r['Div'] > 0.02 else sub_color}">{r['Div']*100:.1f}%</div>
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+    elif "screener_results" not in st.session_state:
+        st.info("Klik 'Start Screener' om te beginnen met scannen.")
+
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.markdown(
